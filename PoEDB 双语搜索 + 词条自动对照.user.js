@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PoEDB 双语搜索 + 词条自动对照
 // @namespace    poedb-bilingual
-// @version      1.1.0
-// @description  poedb.tw 搜索框支持中英双语双向检索；词条页自动内联显示中文/英文对照（悬浮按钮开关，记住状态）；搜索自动补全 wiki 等英文独有词条的中文名
+// @version      1.0.0
+// @description  poedb.tw 搜索框支持中英双语双向检索；词条页自动内联显示中文/英文对照（悬浮按钮开关，记住状态）
 // @author       LazySugar
 // @license      MIT
 // @match        https://poedb.tw/*
@@ -70,47 +70,6 @@
     return data;
   }
 
-  /* ==================== 中文词条名补全（后台预取 /cn 标题） ==================== */
-  function parseCnTitle(title) {
-    if (!title) return null;
-    title = title.trim();
-    // 去掉 "<站名> - 流亡编年史, Path of Exile Wiki cn" 之类的尾部站名前缀
-    const m = title.match(/^(.*?)\s*-\s*(流亡[编編]年史|Path of Exile Wiki|Path of Exile).*$/i);
-    const name = (m ? m[1] : title).trim();
-    return name || null;
-  }
-
-  function getCnTitleCache(slug) {
-    try {
-      const v = localStorage.getItem('poedb_cn_title_' + slug);
-      if (v === '__none__') return null;
-      if (v) return v;
-    } catch (e) {}
-    return undefined;
-  }
-
-  function setCnTitleCache(slug, title) {
-    try { localStorage.setItem('poedb_cn_title_' + slug, title || '__none__'); } catch (e) {}
-  }
-
-  async function fetchCnTitle(slug, enLabel) {
-    const cached = getCnTitleCache(slug);
-    if (cached !== undefined) return cached;
-    let title = null;
-    try {
-      const res = await fetch('/cn/' + slug);
-      if (res.ok) {
-        const text = await res.text();
-        const m = text.match(/<title>([\s\S]*?)<\/title>/i);
-        const name = parseCnTitle(m ? m[1] : '');
-        // 仅当是“真·中文名”（不等于原文/原始 slug）时才采用，避免把英文标题当成中文名
-        if (name && name !== slug && name !== (enLabel || '')) title = name;
-      }
-    } catch (e) { title = null; }
-    setCnTitleCache(slug, title);
-    return title;
-  }
-
   /* ==================== 功能1：双语搜索 ==================== */
   async function initSearch() {
     const $ = window.jQuery;
@@ -163,44 +122,8 @@
       let st = '';
       for (const k in e.labels) st += e.labels[k] + ' ';
       for (const k in e.descs) st += e.descs[k] + ' ';
-      flat.push({ label: dispLabel(e), value: value, desc: dispDesc(e), cls: e.cls, _st: st.toLowerCase(), _e: e });
+      flat.push({ label: dispLabel(e), value: value, desc: dispDesc(e), cls: e.cls, _st: st.toLowerCase() });
     });
-
-    function refreshFlat(it) {
-      const e = it._e;
-      it.label = dispLabel(e);
-      it.desc = dispDesc(e);
-      let st = '';
-      for (const k in e.labels) st += e.labels[k] + ' ';
-      for (const k in e.descs) st += e.descs[k] + ' ';
-      it._st = st.toLowerCase();
-    }
-
-    // 后台预取缺失的中文词条名（wiki 等英文独有词条），限速并发 + 持久缓存
-    async function enrichCnTitles(list) {
-      const pending = list.filter(function (it) { return !it._e.labels['cn']; });
-      if (!pending.length) return;
-      const CONCURRENCY = 4;
-      let i = 0;
-      async function worker() {
-        while (i < pending.length) {
-          const it = pending[i++];
-          const en = it._e.labels['us'] || '';
-          const cn = await fetchCnTitle(it.value, en);
-          if (cn) {
-            it._e.labels['cn'] = cn;
-            refreshFlat(it);
-          }
-        }
-      }
-      const workers = [];
-      for (let w = 0; w < CONCURRENCY; w++) workers.push(worker());
-      await Promise.all(workers);
-      try {
-        const q = ($input.val() || '').trim();
-        if (q) $input.autocomplete('search', q);
-      } catch (e) {}
-    }
 
     function apply() {
       $input.autocomplete({
@@ -236,8 +159,6 @@
     apply();
     setTimeout(apply, 1200);
     setTimeout(apply, 3200);
-
-    enrichCnTitles(flat).catch(function () {});
   }
 
   /* ==================== 功能2：词条自动对照 ==================== */
