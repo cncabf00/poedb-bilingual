@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PoEDB 双语搜索 + 词条自动对照
 // @namespace    poedb-bilingual
-// @version      1.0.0
+// @version      1.1.0
 // @description  poedb.tw 搜索框支持中英双语双向检索；词条页自动内联显示中文/英文对照（悬浮按钮开关，记住状态）
 // @author       LazySugar
 // @license      MIT
@@ -71,6 +71,43 @@
   }
 
   /* ==================== 功能1：双语搜索 ==================== */
+  const FUZZY_TRIGGER_MAX = 10; // 精确子串结果少于该条数时才触发模糊兜底
+  const FUZZY_MIN_QUERY = 3;    // 查询长度低于此值不跑模糊（短词噪声大）
+
+  function fuzzyMaxErrors(len) {
+    if (len <= 5) return 1;
+    if (len <= 9) return 2;
+    return 3;
+  }
+
+  // 编辑距离（Damerau-Levenshtein，最优字符串对齐）：替换/插入/删除/相邻交换各计 1 步。
+  // 相邻交换是最常见 typo（teh→the、chaso→chaos），普通 Levenshtein 需 2 步才能抓到。
+  // 调用方已做长度预过滤，避免对整本词库全量 DP。
+  function levenshtein(a, b) {
+    const m = a.length, n = b.length;
+    if (m === 0) return n;
+    if (n === 0) return m;
+    let prev2 = new Array(n + 1);
+    let prev = new Array(n + 1);
+    let cur = new Array(n + 1);
+    for (let j = 0; j <= n; j++) prev[j] = j;
+    for (let i = 1; i <= m; i++) {
+      cur[0] = i;
+      const ca = a.charCodeAt(i - 1);
+      for (let j = 1; j <= n; j++) {
+        const cb = b.charCodeAt(j - 1);
+        const cost = ca === cb ? 0 : 1;
+        let v = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+        if (i > 1 && j > 1 && ca === b.charCodeAt(j - 2) && a.charCodeAt(i - 2) === cb) {
+          v = Math.min(v, prev2[j - 2] + 1); // 相邻字符交换
+        }
+        cur[j] = v;
+      }
+      const t = prev2; prev2 = prev; prev = cur; cur = t;
+    }
+    return prev[n];
+  }
+
   async function initSearch() {
     const $ = window.jQuery;
     if (!$ || !$.fn.autocomplete) return;
@@ -120,9 +157,18 @@
     const flat = [];
     merged.forEach(function (e, value) {
       let st = '';
-      for (const k in e.labels) st += e.labels[k] + ' ';
+      const lbls = [];
+      for (const k in e.labels) {
+        st += e.labels[k] + ' ';
+        const l = String(e.labels[k]).toLowerCase();
+        if (lbls.indexOf(l) === -1) lbls.push(l);
+        // 拆词：用户常只打多词名的其中一个词（且带 typo），如 chaos orb 里的 chaos
+        l.split(/\s+/).forEach(function (w) {
+          if (w && lbls.indexOf(w) === -1) lbls.push(w);
+        });
+      }
       for (const k in e.descs) st += e.descs[k] + ' ';
-      flat.push({ label: dispLabel(e), value: value, desc: dispDesc(e), cls: e.cls, _st: st.toLowerCase() });
+      flat.push({ label: dispLabel(e), value: value, desc: dispDesc(e), cls: e.cls, _st: st.toLowerCase(), _lbls: lbls });
     });
 
     function apply() {
@@ -132,13 +178,36 @@
           const q = (request.term || '').toLowerCase().trim();
           if (!q) { response([]); return; }
           const starts = [], contains = [];
+          const matched = new Set();
           for (let i = 0; i < flat.length; i++) {
             const it = flat[i];
             const idx = it._st.indexOf(q);
             if (idx === -1) continue;
+            matched.add(i);
             if (idx === 0) starts.push(it); else contains.push(it);
           }
-          response(starts.concat(contains).slice(0, 60));
+          let out = starts.concat(contains);
+          // 精确结果不足时才做拼写容错兜底
+          if (out.length < FUZZY_TRIGGER_MAX && q.length >= FUZZY_MIN_QUERY) {
+            const maxErr = fuzzyMaxErrors(q.length);
+            const qLen = q.length;
+            const fuzzy = [];
+            for (let i = 0; i < flat.length; i++) {
+              if (matched.has(i)) continue;
+              const lbls = flat[i]._lbls;
+              let best = Infinity;
+              for (let k = 0; k < lbls.length; k++) {
+                const lbl = lbls[k];
+                if (Math.abs(lbl.length - qLen) > maxErr) continue; // 长度差超预算则不可能命中
+                const d = levenshtein(lbl, q);
+                if (d < best) best = d;
+              }
+              if (best <= maxErr) fuzzy.push({ it: flat[i], d: best });
+            }
+            fuzzy.sort(function (a, b) { return a.d - b.d; });
+            out = out.concat(fuzzy.map(function (f) { return f.it; }));
+          }
+          response(out.slice(0, 60));
         },
         select: function (event, ui) {
           document.location = '/' + curLang + '/' + ui.item.value;
