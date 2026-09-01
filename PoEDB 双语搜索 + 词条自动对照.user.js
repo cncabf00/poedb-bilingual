@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PoEDB 双语搜索 + 词条自动对照
 // @namespace    poedb-bilingual
-// @version      1.1.0
+// @version      1.1.1
 // @description  poedb.tw 搜索框支持中英双语双向检索；词条页自动内联显示中文/英文对照（悬浮按钮开关，记住状态）
 // @author       LazySugar
 // @license      MIT
@@ -242,6 +242,10 @@
   function cleanBox(box) {
     const clone = box.cloneNode(true);
     clone.querySelectorAll('img,script,style,link,video,audio,iframe').forEach(n => n.remove());
+    // 去掉 itemHeader 里的装饰性 symbol（如 Vaal/变异左右图标）。
+    // 它们是空 span，靠站点 CSS ::after 画绝对定位小图；翻译面板剥掉了
+    // .newItemPopup 外壳后，标题文字不再有为它们预留的 padding，会盖住文本。
+    clone.querySelectorAll('.itemHeader .symbol').forEach(n => n.remove());
     clone.querySelectorAll('a').forEach(a => {
       const span = document.createElement('span');
       span.innerHTML = a.innerHTML;
@@ -251,7 +255,8 @@
   }
 
   async function fetchTranslation(slug, tLang) {
-    const key = 'poedb_tr_' + tLang + '_' + slug;
+    // key 带版本号：cleanBox 输出格式变化时让旧会话缓存自动失效
+    const key = 'poedb_tr_v2_' + tLang + '_' + slug;
     try {
       const cached = sessionStorage.getItem(key);
       if (cached) return { html: cached, lang: tLang };
