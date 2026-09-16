@@ -486,6 +486,104 @@ def regenerate_section(groups, tier_display, new_assignment):
     return out
 
 
+# ============================== filterblade (NeverSink) 解析/生成 ==============================
+
+FILTERBLADE_TIER_MAP = {"s": "S", "a": "A", "b": "B", "c": "C", "d": "D", "e": "E"}
+FILTERBLADE_TIER_REVERSE = {v: k for k, v in FILTERBLADE_TIER_MAP.items()}
+
+# 块头：Show # %H8 $type->currency $tier->a !currency_a
+FILTERBLADE_HEADER_RE = re.compile(
+    r'^(Show|Hide) # (?:%\w+\s+)?\$type->([\w>-]+) \$tier->(\w+)\s+!(\w+)$'
+)
+
+
+def parse_filterblade(lines):
+    """解析 filterblade 的通货块，返回 (groups, tier_meta, blocks)。
+
+    groups: [{name: type_marker, class, currencies: {name: {base, promotions}}}]
+    tier_meta: {tier: {action, style, identifier, class_line, display}}
+    blocks: [{type, tier, basetype_idx, start_idx, end_idx}]（用于原位替换）
+    """
+    groups = {}  # (type, class) -> {name, class, currencies}
+    tier_meta = {}
+    blocks = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i].rstrip("\r\n")
+        m = FILTERBLADE_HEADER_RE.match(line)
+        if m:
+            action, type_marker, tier_raw, identifier = m.groups()
+            tier = FILTERBLADE_TIER_MAP.get(tier_raw)
+            start_idx = i
+            j = i + 1
+            body = []
+            while j < n and lines[j].strip() != "":
+                body.append(lines[j].rstrip("\r\n"))
+                j += 1
+            end_idx = j
+            class_line = None
+            class_val = None
+            basetype_idx = None
+            base_types = []
+            display = []
+            for k, ln in enumerate(body):
+                s = ln.lstrip("\t")
+                if s.startswith("Class =="):
+                    class_line = ln
+                    cm = re.search(r'"([^"]+)"', s)
+                    class_val = cm.group(1) if cm else None
+                elif s.startswith("BaseType =="):
+                    basetype_idx = start_idx + 1 + k
+                    base_types = re.findall(r'"([^"]+)"', s)
+                else:
+                    display.append(ln)
+            style_m = re.search(r'%\w+', line)
+            style = style_m.group(0) if style_m else ""
+            if tier is not None:
+                key = (type_marker, class_val)
+                grp = groups.setdefault(
+                    key, {"name": type_marker, "class": class_val, "currencies": {}}
+                )
+                tier_meta.setdefault(tier, {
+                    "action": action, "style": style, "identifier": identifier,
+                    "class_line": class_line, "display": display,
+                })
+                blocks.append({
+                    "type": type_marker, "tier": tier,
+                    "basetype_idx": basetype_idx, "start_idx": start_idx, "end_idx": end_idx,
+                })
+                for bt in base_types:
+                    grp["currencies"].setdefault(bt, {"base": tier, "promotions": []})
+            i = j
+            while i < n and lines[i].strip() == "":
+                i += 1
+        else:
+            i += 1
+    return list(groups.values()), tier_meta, blocks
+
+
+def regenerate_filterblade(lines, groups, tier_meta, blocks, new_assignments):
+    """原位替换 filterblade 通货块的 BaseType（空档则删除整块）。"""
+    type_items = {}
+    for grp in groups:
+        for base_tier in TIER_ORDER:
+            names = [bt for bt, rec in grp["currencies"].items()
+                     if new_assignments.get(bt, rec)["base"] == base_tier]
+            if names:
+                type_items[(grp["name"], base_tier)] = sorted(names)
+
+    result = list(lines)
+    for b in sorted(blocks, key=lambda x: -x["start_idx"]):  # 从后往前，避免索引偏移
+        key = (b["type"], b["tier"])
+        names = type_items.get(key)
+        if names:
+            result[b["basetype_idx"]] = "\tBaseType == " + " ".join(f'"{n}"' for n in names)
+        else:
+            del result[b["start_idx"]:b["end_idx"]]
+    return result
+
+
 # ============================== 主流程 ==============================
 
 def make_output_path(filter_path, explicit_output):
@@ -496,9 +594,8 @@ def make_output_path(filter_path, explicit_output):
     return p.with_name(p.stem + "-cn" + p.suffix)
 
 
-def process_format(lines, parsed, global_tier_display, cn_prices, intl_prices,
-                   chaos_in_e, divine_in_e, price_fields, output_path, verbose):
-    """相对判定重新分级 → 打印汇总 → 重新生成并写文件。"""
+def re_tier(parsed, cn_prices, intl_prices, chaos_in_e, divine_in_e, price_fields, verbose):
+    """相对判定重新分级（共享逻辑），返回 (new_assignments, total_items, total_changed)。"""
     # 1) 对每个段/组重新分级（相对判定）
     new_assignments = {}
     total_items = 0
@@ -555,7 +652,11 @@ def process_format(lines, parsed, global_tier_display, cn_prices, intl_prices,
         f"{total_items - total_changed} 个不变"
     )
 
-    # 3) 重新生成并写回
+    return new_assignments, total_items, total_changed
+
+
+def regenerate_poe2filter(lines, parsed, tier_display, new_assignments):
+    """重新生成 poe2filter 格式（替换各段）。"""
     new_lines = []
     cursor = 0
     for title, start, end, groups in parsed:
@@ -563,14 +664,11 @@ def process_format(lines, parsed, global_tier_display, cn_prices, intl_prices,
         new_lines.append(f"### {title}")
         new_lines.append("#######################################################")
         new_lines.append("")
-        new_section = regenerate_section(groups, global_tier_display, new_assignments)
+        new_section = regenerate_section(groups, tier_display, new_assignments)
         new_lines.extend(new_section)
         cursor = end - 1  # 下一段的开头分隔线留给下一轮
     new_lines.extend(lines[cursor:])
-
-    output_path.write_text("\n".join(new_lines), encoding="utf-8")
-    print(f"[完成] 输出：{output_path}")
-    return total_items, total_changed
+    return new_lines
 
 
 def main(argv=None):
@@ -598,7 +696,11 @@ def main(argv=None):
     filter_path = Path(args.filter).expanduser()
     if not filter_path.exists():
         sys.exit(f"[错误] 找不到过滤器文件：{filter_path}")
-    lines = filter_path.read_text(encoding="utf-8").split("\n")
+    raw_bytes = filter_path.read_bytes()
+    crlf = b"\r\n" in raw_bytes
+    raw = raw_bytes.decode("utf-8")
+    lines = [l.rstrip("\r") for l in raw.split("\n")]
+    newline = "\r\n" if crlf else "\n"
 
     # 2. 拉取价格（国服 + 国际服）
     token = args.token if args.token else load_api_token()
@@ -611,33 +713,41 @@ def main(argv=None):
     intl_prices = poe_ninja.fetch_international_prices()
     print(f"[国际服] 抓到 {len(intl_prices)} 个通货价格")
 
-    # 3. 定位并解析段
-    if args.format == "filterblade":
-        sys.exit("[错误] filterblade 支持开发中，暂只支持 poe2filter")
-    sections = locate_sections(lines)
-    if not sections:
-        sys.exit(f"[错误] 未找到 '{AREA_START}' 区域，过滤器结构可能不匹配")
+    # 3. 按格式解析
+    if args.format == "poe2filter":
+        sections = locate_sections(lines)
+        if not sections:
+            sys.exit(f"[错误] 未找到 '{AREA_START}' 区域，过滤器结构可能不匹配")
+        parsed = []  # (title, start, end, groups)
+        tier_display = {}
+        for title, start, end in sections:
+            groups, td = parse_section(lines[start + 1 : end])
+            if not groups:
+                continue
+            # 跳过完全查不到的段（0% 覆盖），保持原样
+            has_match = any(bt in cn_prices for grp in groups for bt in grp["currencies"])
+            if not has_match:
+                continue
+            for tier, meta in td.items():
+                tier_display.setdefault(tier, meta)
+            parsed.append((title, start, end, groups))
+    else:
+        groups, tier_display, blocks = parse_filterblade(lines)
+        parsed = [("filterblade", 0, 0, groups)]
 
-    parsed = []  # (title, start, end, groups)
-    global_tier_display = {}
-    for title, start, end in sections:
-        groups, tier_display = parse_section(lines[start + 1 : end])
-        if not groups:
-            continue
-        # 跳过完全查不到的段（0% 覆盖），保持原样
-        has_match = any(bt in cn_prices for grp in groups for bt in grp["currencies"])
-        if not has_match:
-            continue
-        for tier, meta in tier_display.items():
-            global_tier_display.setdefault(tier, meta)
-        parsed.append((title, start, end, groups))
-
-    # 4. 重新分级并写回
-    output_path = make_output_path(filter_path, args.output)
-    process_format(
-        lines, parsed, global_tier_display, cn_prices, intl_prices,
-        chaos_in_e, divine_in_e, price_fields, output_path, args.verbose,
+    # 4. 相对判定重新分级（共享）
+    new_assignments, _, _ = re_tier(
+        parsed, cn_prices, intl_prices, chaos_in_e, divine_in_e, price_fields, args.verbose,
     )
+
+    # 5. 按格式重新生成并写回
+    if args.format == "poe2filter":
+        new_lines = regenerate_poe2filter(lines, parsed, tier_display, new_assignments)
+    else:
+        new_lines = regenerate_filterblade(lines, groups, tier_display, blocks, new_assignments)
+    output_path = make_output_path(filter_path, args.output)
+    output_path.write_text(newline.join(new_lines), encoding="utf-8")
+    print(f"[完成] 输出：{output_path}")
 
 
 if __name__ == "__main__":
