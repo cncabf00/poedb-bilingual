@@ -492,13 +492,111 @@ def regenerate_section(groups, tier_display, new_assignment):
 
 # ============================== 主流程 ==============================
 
-def resolve_paths(args):
-    filter_path = Path(args.filter).expanduser()
-    if args.output:
-        output_path = Path(args.output).expanduser()
+def make_output_path(filter_path, explicit_output, level):
+    """生成输出路径。level 会以 slug 形式加进文件名（空格→连字符）。"""
+    slug = level.replace(" ", "-")
+    if explicit_output:
+        p = Path(explicit_output).expanduser()
+        stem = p.stem
     else:
-        output_path = filter_path.with_name(filter_path.stem + "-cn" + filter_path.suffix)
-    return filter_path, output_path
+        p = Path(filter_path).expanduser()
+        stem = p.stem + "-cn"
+    suffix = p.suffix
+    return p.with_name(f"{stem}-{slug}{suffix}")
+
+
+def process_level(level, lines, parsed, global_tier_display, prices, anchors,
+                  price_fields, output_path, verbose):
+    """对单个 level：重新分级 → 打印汇总 → 重新生成并写文件。"""
+    chaos_in_e, divine_in_e = anchors
+
+    # 1) 对每个通货重新分级（全局价格查询）
+    new_assignments = {}
+    total_items = 0
+    total_changed = 0
+    section_summary = []
+    detail_rows = []
+
+    for title, start, end, groups in parsed:
+        n_items = 0
+        n_changed = 0
+        for grp in groups:
+            stackable = grp["class"] == "Stackable Currency"
+            for bt, old_rec in grp["currencies"].items():
+                n_items += 1
+                item = prices.get(bt)
+                if item is None:
+                    # API 查不到：保留原分级
+                    new_assignments[bt] = {
+                        "base": old_rec["base"],
+                        "promotions": list(old_rec["promotions"]),
+                    }
+                    detail_rows.append((title, bt, old_rec["base"], old_rec["base"], None, "查不到，保留"))
+                    continue
+
+                ve = value_in_e(item, divine_in_e, price_fields)
+                if ve is None:
+                    new_assignments[bt] = {
+                        "base": old_rec["base"],
+                        "promotions": list(old_rec["promotions"]),
+                    }
+                    detail_rows.append((title, bt, old_rec["base"], old_rec["base"], None, "无价格，保留"))
+                    continue
+
+                values = {
+                    "divine": ve / divine_in_e,
+                    "chaos": ve / chaos_in_e,
+                    "exalted": ve,
+                }
+                base, promotions = compute_assignment(values, level, stackable=stackable)
+                new_assignments[bt] = {"base": base, "promotions": promotions}
+
+                if base != old_rec["base"]:
+                    n_changed += 1
+                proms_str = ", ".join(f"{n}+→{t}" for n, t in promotions) or "-"
+                detail_rows.append(
+                    (title, bt, old_rec["base"], base, round(values["chaos"], 3), proms_str)
+                )
+
+        total_items += n_items
+        total_changed += n_changed
+        section_summary.append((title, n_items, n_changed))
+
+    # 2) 打印汇总
+    print(f"\n=== [{level}] 各段重新分级汇总 ===")
+    print(f"{'段':<24}{'物品数':>6}{'变动数':>8}")
+    for title, n_items, n_changed in section_summary:
+        print(f"{title:<24}{n_items:>6}{n_changed:>8}")
+
+    if verbose:
+        print("\n=== 详细对照表 ===")
+        print(f"{'段':<22}{'通货':<34}{'旧':<5}{'新':<5}{'价值(混沌)':<12}堆叠升档")
+        for title, name, old_tier, new_tier, vc, proms in detail_rows:
+            mark = "" if old_tier == new_tier else " *"
+            vc_s = str(vc) if vc is not None else "-"
+            print(f"{title:<22}{name:<34}{old_tier or '-':<5}{new_tier:<5}{vc_s:<12}{proms}{mark}")
+
+    print(
+        f"[统计] 共 {total_items} 个通货类物品，其中 {total_changed} 个 tier 发生变化，"
+        f"{total_items - total_changed} 个不变"
+    )
+
+    # 3) 重新生成并写回
+    new_lines = []
+    cursor = 0
+    for title, start, end, groups in parsed:
+        new_lines.extend(lines[cursor:start])
+        new_lines.append(f"### {title}")
+        new_lines.append("#######################################################")
+        new_lines.append("")
+        new_section = regenerate_section(groups, global_tier_display, new_assignments)
+        new_lines.extend(new_section)
+        cursor = end - 1  # 下一段的开头分隔线留给下一轮
+    new_lines.extend(lines[cursor:])
+
+    output_path.write_text("\n".join(new_lines), encoding="utf-8")
+    print(f"[完成] 输出：{output_path}")
+    return total_items, total_changed
 
 
 def main(argv=None):
@@ -507,8 +605,8 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--filter", default=str(DEFAULT_FILTER), help="过滤器路径")
-    parser.add_argument("--output", default=None, help="输出路径（默认同名 + -cn 后缀）")
-    parser.add_argument("--level", default="very strict", help="分级档位（very strict / strict / normal / early-game）")
+    parser.add_argument("--output", default=None, help="输出路径（默认同名 + -cn-{level} 后缀）")
+    parser.add_argument("--level", default="very strict", help="分级档位（very strict / strict / normal / early-game / all）")
     parser.add_argument("--token", default=None, help="poecurrency.top API Token（可选，优先于 config 文件）")
     parser.add_argument(
         "--price-field",
@@ -519,14 +617,14 @@ def main(argv=None):
     parser.add_argument("--verbose", action="store_true", help="打印每件物品的详细对照表")
     args = parser.parse_args(argv)
 
-    if args.level not in LEVELS:
-        sys.exit(f"[错误] 档位 '{args.level}' 尚未支持。当前支持: {list(LEVELS.keys())}")
+    if args.level != "all" and args.level not in LEVELS:
+        sys.exit(f"[错误] 档位 '{args.level}' 不支持。可选: all / {', '.join(LEVELS)}")
 
     # 取值字段顺序：用户选的字段排最前，其余兜底
     price_fields = [args.price_field] + [f for f in PRICE_FIELDS if f != args.price_field]
 
     # 1. 读过滤器
-    filter_path, output_path = resolve_paths(args)
+    filter_path = Path(args.filter).expanduser()
     if not filter_path.exists():
         sys.exit(f"[错误] 找不到过滤器文件：{filter_path}")
     lines = filter_path.read_text(encoding="utf-8").split("\n")
@@ -560,93 +658,16 @@ def main(argv=None):
             global_tier_display.setdefault(tier, meta)
         parsed.append((title, start, end, groups))
 
-    # 5. 对每个通货重新分级（全局价格查询）
-    new_assignments = {}  # {currency_name: {"base", "promotions"}}
-    total_items = 0
-    total_changed = 0
-    section_summary = []  # (title, n_items, n_changed)
-    detail_rows = []  # (section, name, old, new, value_chaos, proms)
-
-    for title, start, end, groups in parsed:
-        n_items = 0
-        n_changed = 0
-        for grp in groups:
-            stackable = grp["class"] == "Stackable Currency"
-            for bt, old_rec in grp["currencies"].items():
-                n_items += 1
-                item = prices.get(bt)
-                if item is None:
-                    # API 查不到：保留原分级
-                    new_assignments[bt] = {
-                        "base": old_rec["base"],
-                        "promotions": list(old_rec["promotions"]),
-                    }
-                    detail_rows.append((title, bt, old_rec["base"], old_rec["base"], None, "查不到，保留"))
-                    continue
-
-                ve = value_in_e(item, divine_in_e, price_fields)
-                if ve is None:
-                    new_assignments[bt] = {
-                        "base": old_rec["base"],
-                        "promotions": list(old_rec["promotions"]),
-                    }
-                    detail_rows.append((title, bt, old_rec["base"], old_rec["base"], None, "无价格，保留"))
-                    continue
-
-                values = {
-                    "divine": ve / divine_in_e,
-                    "chaos": ve / chaos_in_e,
-                    "exalted": ve,  # 1e = 1 崇高石
-                }
-                base, promotions = compute_assignment(
-                    values, args.level, stackable=stackable
-                )
-                new_assignments[bt] = {"base": base, "promotions": promotions}
-
-                if base != old_rec["base"]:
-                    n_changed += 1
-                proms_str = ", ".join(f"{n}+→{t}" for n, t in promotions) or "-"
-                detail_rows.append(
-                    (title, bt, old_rec["base"], base, round(values["chaos"], 3), proms_str)
-                )
-
-        total_items += n_items
-        total_changed += n_changed
-        section_summary.append((title, n_items, n_changed))
-
-    # 6. 打印汇总
-    print("\n=== 各段重新分级汇总（旧 tier → 新 tier）===")
-    print(f"{'段':<24}{'物品数':>6}{'变动数':>8}")
-    for title, n_items, n_changed in section_summary:
-        print(f"{title:<24}{n_items:>6}{n_changed:>8}")
-
-    if args.verbose:
-        print("\n=== 详细对照表 ===")
-        print(f"{'段':<22}{'通货':<34}{'旧':<5}{'新':<5}{'价值(混沌)':<12}堆叠升档")
-        for title, name, old_tier, new_tier, vc, proms in detail_rows:
-            mark = "" if old_tier == new_tier else " *"
-            vc_s = str(vc) if vc is not None else "-"
-            print(f"{title:<22}{name:<34}{old_tier or '-':<5}{new_tier:<5}{vc_s:<12}{proms}{mark}")
-
-    print(f"\n[统计] 共 {total_items} 个通货类物品，其中 {total_changed} 个 tier 发生变化，"
-          f"{total_items - total_changed} 个不变")
-
-    # 7. 重新生成并写回
-    new_lines = []
-    cursor = 0
-    for title, start, end, groups in parsed:
-        # 保留到段标题之前（含标题上方的分隔线）
-        new_lines.extend(lines[cursor:start])
-        new_lines.append(f"### {title}")
-        new_lines.append("#######################################################")
-        new_lines.append("")
-        new_section = regenerate_section(groups, global_tier_display, new_assignments)
-        new_lines.extend(new_section)
-        cursor = end - 1  # 下一段的开头分隔线留给下一轮
-    new_lines.extend(lines[cursor:])
-
-    output_path.write_text("\n".join(new_lines), encoding="utf-8")
-    print(f"\n[完成] 输出：{output_path}")
+    # 5. 对每个 level 重新分级并写文件（"all" 时一次性导出所有档位）
+    levels = list(LEVELS.keys()) if args.level == "all" else [args.level]
+    anchors = (chaos_in_e, divine_in_e)
+    for level in levels:
+        output_path = make_output_path(filter_path, args.output, level)
+        print(f"\n{'=' * 16} 档位: {level} {'=' * 16}")
+        process_level(
+            level, lines, parsed, global_tier_display, prices, anchors,
+            price_fields, output_path, args.verbose,
+        )
 
 
 if __name__ == "__main__":
