@@ -18,12 +18,18 @@ poe2filter-cn-tier.py — POE2 过滤器国服通货重分级工具
     # 携带 API Token（可选；无 token 时用免费 summary 接口）
     python3 poe2filter-cn-tier.py --token <你的token>
 
+    # 更省事：在脚本同目录放一个 poe2filter-cn-tier-config.py，里面写
+    #     API_TOKEN = "你的token"
+    # 脚本会自动 import 读取，就不用每次敲 --token 了。
+
 参数（均可选）：
     --filter PATH   过滤器路径。默认：<用户目录>/Documents/My Games/Path of Exile 2/poe2filter.filter
     --output PATH   输出路径。默认：同名文件 + "-cn" 后缀（如 poe2filter-cn.filter）
     --level STR     分级档位。当前仅支持 "very strict"（默认）。
-    --token STR     poecurrency.top 的 API Token（可选）。
+    --token STR     poecurrency.top 的 API Token（可选，优先于 config 文件）。
     --price-field   取值字段，默认 buy_avg（可选 buy_avg / sell_avg / latest_buy1 / latest_sell1）。
+
+    API Token 读取优先级：命令行 --token > 同目录 poe2filter-cn-tier-config.py 里的 API_TOKEN > 无（免费接口）。
 
 分级规则（very strict，单件价值）：
     S: >= 10 神圣石 (Divine Orb)
@@ -36,6 +42,7 @@ poe2filter-cn-tier.py — POE2 过滤器国服通货重分级工具
 """
 
 import argparse
+import importlib.util
 import json
 import re
 import sys
@@ -76,6 +83,10 @@ DEFAULT_FILTER = (
     Path.home() / "Documents" / "My Games" / "Path of Exile 2" / "poe2filter.filter"
 )
 
+# 本地配置文件（与脚本同目录，可选）：里面定义 API_TOKEN = "..."，脚本会自动 import 读取。
+# 该文件含密钥，不要提交到公开仓库。
+CONFIG_FILE = "poe2filter-cn-tier-config.py"
+
 # 锚点通货（用于把 e/d 计价统一折算成“混沌”）。
 CHAOS_NAME = "Chaos Orb"    # C = 混沌石
 DIVINE_NAME = "Divine Orb"  # D = 神圣石
@@ -83,6 +94,31 @@ EXALTED_NAME = "Exalted Orb"  # e 计价基准（崇高石）
 
 
 # ============================== 数据获取 ==============================
+
+def load_api_token():
+    """默认尝试从脚本同目录 import poe2filter-cn-tier-config.py，读取其中的 API_TOKEN。
+
+    存在且是有效 token 就返回；否则返回 None（走免费 summary 接口）。
+    整个 import 用 try 包住，文件缺失 / 语法错 / 无 API_TOKEN 都不报错。
+    """
+    script_dir = Path(__file__).resolve().parent
+    config_path = script_dir / CONFIG_FILE
+    if not config_path.exists():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_poe2filter_cn_tier_config", str(config_path)
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        token = getattr(mod, "API_TOKEN", None)
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] 读取 {CONFIG_FILE} 失败：{e}")
+        return None
+    if isinstance(token, str) and token.strip() and not token.strip().lower().startswith("xxxxx"):
+        return token.strip()
+    return None
+
 
 def http_get_json(url, timeout=30):
     """GET 一个 JSON 接口，返回解析后的对象。"""
@@ -400,7 +436,7 @@ def main(argv=None):
     parser.add_argument("--filter", default=str(DEFAULT_FILTER), help="过滤器路径")
     parser.add_argument("--output", default=None, help="输出路径（默认同名 + -cn 后缀）")
     parser.add_argument("--level", default="very strict", help="分级档位（当前仅 very strict）")
-    parser.add_argument("--token", default=None, help="poecurrency.top API Token（可选）")
+    parser.add_argument("--token", default=None, help="poecurrency.top API Token（可选，优先于 config 文件）")
     parser.add_argument(
         "--price-field",
         default="buy_avg",
@@ -432,7 +468,9 @@ def main(argv=None):
         sys.exit("[错误] 未能解析出 Class 行，段结构可能异常")
 
     # 3. 拉取价格并计算锚点
-    prices = fetch_prices(args.token)
+    # token 优先级：命令行 --token > 同目录 config 文件的 API_TOKEN > 无（免费接口）
+    token = args.token if args.token else load_api_token()
+    prices = fetch_prices(token)
     chaos_in_e, divine_in_e = compute_anchors(prices, price_fields)
     print(
         f"[锚点] 1 混沌 ≈ {chaos_in_e} e, 1 神圣 ≈ {divine_in_e} e "
