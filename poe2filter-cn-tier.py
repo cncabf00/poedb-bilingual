@@ -26,21 +26,19 @@ poe2filter-cn-tier.py — POE2 过滤器国服通货重分级工具
 参数（均可选）：
     --filter PATH   过滤器路径。默认：<用户目录>/Documents/My Games/Path of Exile 2/poe2filter.filter
     --output PATH   输出路径。默认：同名文件 + "-cn" 后缀（如 poe2filter-cn.filter）
-    --level STR     分级档位。当前仅支持 "very strict"（默认）。
+    --level STR     分级档位：very strict / strict / normal / early-game（默认 very strict）。
     --token ***     poecurrency.top 的 API Token（可选，优先于 config 文件）。
     --price-field   取值字段，默认 buy_avg（可选 buy_avg / sell_avg / latest_buy1 / latest_sell1）。
     --verbose       打印每件物品的详细对照表（默认只打印每段汇总）。
 
     API Token 读取优先级：命令行 --token *** 同目录 poe2filter-cn-tier-config.py 里的 API_TOKEN > 无（免费接口）。
 
-分级规则（very strict，单件价值）：
-    S: >= 10 神圣石 (Divine Orb)
-    A: >= 3  神圣石
-    B: >= 1  神圣石
-    C: >= 2  混沌石 (Chaos Orb)
-    D: ~ 1   混沌石（落在 [0.5, 2) 混沌区间，即 C 与 E 之间）
-    E: >= 0.1 混沌石
-    F: <  0.1 混沌石
+分级规则（单件价值；单位：C=混沌石 Chaos Orb，D=神圣石 Divine Orb，E=崇高石 Exalted Orb）：
+    very strict : S>=10D  A>=3D  B>=1D   C>=2C   D~1C    E<0.5C   F<0.1C
+    strict      : S>=3D   A>=1D  B>=2C   C~1C   D<0.5C  E<0.1C   F<0.05C
+    normal      : S>=100E A>=15E B>=3E   C~1E   D<0.5E  E<0.1E   F<0.01E
+    early-game  : S>=20E  A>=2.5E B~1E   C<0.75E D<0.2E  E<0.1E   F<0.001E
+    （"~" 表示中间档，落在上下两档之间；各档具体下界见脚本内 LEVELS 字典）
 """
 
 import argparse
@@ -56,9 +54,10 @@ from pathlib import Path
 
 API_BASE = "https://poecurrency.top"
 
-# 分级档位。每个 tier 的价值下界（自上而下匹配），单位 "divine"(神圣石) 或 "chaos"(混沌石)。
-# 注意 "D: ~1C" 这里解释为 [0.5C, 2C) 区间（介于 C 的 2C 与 E 的 0.5C 之间），
-# 若你想把 D 的下界改成 1C，把下面的 0.5 改成 1.0 即可。
+# 分级档位。每个 tier 的价值下界（自上而下匹配），单位三种：
+#   "divine" = 神圣石(D)、"chaos" = 混沌石(C)、"exalted" = 崇高石(E)。
+# 每个档的阈值保持「原生单位」，不把 D 档换算成 C/E 再去比。
+# 注："~1C" 这类中间档，其下界取下一档的上界（如 [0.5C, 2C)），即无缝隙分区。
 LEVELS = {
     "very strict": {
         "S": ("divine", 10),
@@ -67,7 +66,34 @@ LEVELS = {
         "C": ("chaos", 2),
         "D": ("chaos", 0.5),
         "E": ("chaos", 0.1),
-        "F": ("chaos", 0.0),  # 兜底：低于 E 下界
+        "F": ("chaos", 0.0),
+    },
+    "strict": {
+        "S": ("divine", 3),
+        "A": ("divine", 1),
+        "B": ("chaos", 2),
+        "C": ("chaos", 0.5),
+        "D": ("chaos", 0.1),
+        "E": ("chaos", 0.05),
+        "F": ("chaos", 0.0),
+    },
+    "normal": {
+        "S": ("exalted", 100),
+        "A": ("exalted", 15),
+        "B": ("exalted", 3),
+        "C": ("exalted", 0.5),
+        "D": ("exalted", 0.1),
+        "E": ("exalted", 0.01),
+        "F": ("exalted", 0.0),
+    },
+    "early-game": {
+        "S": ("exalted", 20),
+        "A": ("exalted", 2.5),
+        "B": ("exalted", 0.75),
+        "C": ("exalted", 0.2),
+        "D": ("exalted", 0.1),
+        "E": ("exalted", 0.001),
+        "F": ("exalted", 0.0),
     },
 }
 
@@ -226,38 +252,34 @@ def value_in_e(item, divine_in_e, price_fields):
 
 # ============================== 分级 ==============================
 
-def tier_of(value_divine, value_chaos, level):
-    """按价值分级。
+def tier_of(values, level):
+    """按价值分级。values: {"divine": float, "chaos": float, "exalted": float}
 
-    分级标准保持「原生单位」：S/A/B 档直接用神圣石(D)衡量，C/D/E/F 档直接用混沌石(C)衡量。
-    不把「B = 1 神圣」这个标准换算成混沌再去比——因为 1 神圣值多少混沌是随汇率浮动的，
-    而标准应该钉死在「1 神圣」上不动。
+    分级标准保持「原生单位」：各档用各自的计价单位（divine/chaos/exalted）直接比较，
+    不把标准换算成别的单位再去比——因为单位间的汇率是浮动的，而标准应该钉死在原单位上。
     """
     thresholds = LEVELS[level]
     for tier in TIER_ORDER:
         unit, thresh = thresholds[tier]
-        if unit == "divine":
-            if value_divine >= thresh:
-                return tier
-        else:
-            if value_chaos >= thresh:
-                return tier
+        if values[unit] >= thresh:
+            return tier
     return "F"  # 理论上到不了这里
 
 
-def compute_assignment(value_divine, value_chaos, level, stackable=True):
-    """给定单件价值（同时有神圣/混沌两个量纲），返回 (base_tier, [(N, target_tier), ...])。
+def compute_assignment(values, level, stackable=True):
+    """给定单件价值（含 divine/chaos/exalted 三个量纲），返回 (base_tier, [(N, target), ...])。
 
     堆叠规则：poe2filter.com 会把“大额堆叠”视为总价值更高，从而升档。
     这里按 N∈{3,5,10,20} 检查 N×单件价值 是否跨入更高 tier。
     仅 stackable（可堆叠通货）才计算堆叠升档。
     """
-    base = tier_of(value_divine, value_chaos, level)
+    base = tier_of(values, level)
     promotions = []
     if stackable:
         prev = base
         for n in sorted(STACK_CHECKPOINTS):  # 3,5,10,20 升序
-            t = tier_of(n * value_divine, n * value_chaos, level)
+            n_values = {u: v * n for u, v in values.items()}
+            t = tier_of(n_values, level)
             if TIER_RANK[t] < TIER_RANK[prev]:  # t 比 prev 更高档
                 promotions.append((n, t))
                 prev = t
@@ -486,7 +508,7 @@ def main(argv=None):
     )
     parser.add_argument("--filter", default=str(DEFAULT_FILTER), help="过滤器路径")
     parser.add_argument("--output", default=None, help="输出路径（默认同名 + -cn 后缀）")
-    parser.add_argument("--level", default="very strict", help="分级档位（当前仅 very strict）")
+    parser.add_argument("--level", default="very strict", help="分级档位（very strict / strict / normal / early-game）")
     parser.add_argument("--token", default=None, help="poecurrency.top API Token（可选，优先于 config 文件）")
     parser.add_argument(
         "--price-field",
@@ -571,10 +593,13 @@ def main(argv=None):
                     detail_rows.append((title, bt, old_rec["base"], old_rec["base"], None, "无价格，保留"))
                     continue
 
-                value_divine = ve / divine_in_e
-                value_chaos = ve / chaos_in_e
+                values = {
+                    "divine": ve / divine_in_e,
+                    "chaos": ve / chaos_in_e,
+                    "exalted": ve,  # 1e = 1 崇高石
+                }
                 base, promotions = compute_assignment(
-                    value_divine, value_chaos, args.level, stackable=stackable
+                    values, args.level, stackable=stackable
                 )
                 new_assignments[bt] = {"base": base, "promotions": promotions}
 
@@ -582,7 +607,7 @@ def main(argv=None):
                     n_changed += 1
                 proms_str = ", ".join(f"{n}+→{t}" for n, t in promotions) or "-"
                 detail_rows.append(
-                    (title, bt, old_rec["base"], base, round(value_chaos, 3), proms_str)
+                    (title, bt, old_rec["base"], base, round(values["chaos"], 3), proms_str)
                 )
 
         total_items += n_items
