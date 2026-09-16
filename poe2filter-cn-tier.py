@@ -11,7 +11,7 @@ poe2filter-cn-tier.py — POE 过滤器国服通货重分级工具（支持 POE1
   2. 相邻两档分界点 = (上一档下界 + 下一档上界) / 2
   3. 用国服价（poecurrency.top）相对分界点重新落档
   4. C/D/E 三个标志通货（混沌/神圣/崇高石）钉在原档位不动
-  5. 国服查不到的道具直接删除（国际服比国服多出的物品）
+  5. 国服查不到的道具删除（国际服比国服多出的物品）；白名单（KEEP_WHITELIST）里的基础通货保留原档
 
 用法示例：
     # 默认：同时处理 POE1 + POE2 默认目录（自动扫 .filter，排除 -cn，自动识别格式）
@@ -93,6 +93,57 @@ EXALTED_NAME = "Exalted Orb"  # e 计价基准（崇高石）
 
 # 锚定通货（相对判定里，这三个标志通货钉在原档位，不随汇率浮动）
 ANCHOR_NAMES = {CHAOS_NAME, DIVINE_NAME, EXALTED_NAME}
+
+# 白名单：国服「有」但 poecurrency.top 没收录价格的通货（基础通货/碎片/催化剂等）。
+# 这些国服游戏里肯定存在，只是 API 没价格；删除时按白名单保留原档，防误删。
+KEEP_WHITELIST = {
+    # 通用基础通货（POE1 + POE2 都有）
+    "Scroll of Wisdom",
+    "Orb of Alchemy",
+    "Orb of Transmutation",
+    "Orb of Binding",
+    "Blessed Orb",
+    "Jeweller's Orb",
+    "Blacksmith's Whetstone",
+    "Armourer's Scrap",
+    "Portal Scroll",
+    # POE2 碎片（shard）
+    "Artificer's Shard",
+    "Chance Shard",
+    "Regal Shard",
+    "Transmutation Shard",
+    "Fracturing Shard",
+    # POE2 献祭石（Ritual）
+    "Kamasa's Orb of Sacrifice",
+    "Kopec's Orb of Sacrifice",
+    "Yaomac's Orb of Sacrifice",
+    "Yugul's Orb of Sacrifice",
+    # POE1 催化剂（Catalyst，国服有）
+    "Abrasive Catalyst",
+    "Accelerating Catalyst",
+    "Fertile Catalyst",
+    "Imbued Catalyst",
+    "Intrinsic Catalyst",
+    "Noxious Catalyst",
+    "Prismatic Catalyst",
+    "Tempering Catalyst",
+    "Turbulent Catalyst",
+    "Unstable Catalyst",
+    "Tainted Catalyst",
+    # POE1 生命之力（Lifeforce，Harvest，国服有）
+    "Primal Lifeforce",
+    "Sacred Lifeforce",
+    "Sandswept Lifeforce",
+    "Vivid Lifeforce",
+    "Wild Lifeforce",
+    # POE1 其他稳定通货（国服有）
+    "Enkindling Orb",
+    "Instilling Orb",
+    "Reflecting Mist",
+    "Rogue's Marker",
+    "Tainted Divine Orb",
+    "Tainted Jeweller's Orb",
+}
 
 # 要处理的区域：从 "Tiered Currency Rules" 之后，到 "Bottom Free-text Rules" 之前。
 # 之前的 Uniques/Gear/Jewellery 等装备段、以及 "Currency Rules"（Gold 规则）都不处理。
@@ -237,6 +288,8 @@ def compute_anchors(game, prices, price_fields):
 
 def cn_value_in_chaos(game, item, anchors, price_fields):
     """把国服某通货折到「混沌」计价。返回 float 或 None（无法判定）。"""
+    if item is None:
+        return None
     price = first_nonzero(item, price_fields)
     unit = item.get("currency_unit")
 
@@ -644,14 +697,15 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, verbose
     removed_rows = []
     section_summary = []
     detail_rows = []
+    keep_norm = {normalize_name(n) for n in KEEP_WHITELIST}
 
     for title, start, end, groups in parsed:
         n_items = 0
         n_changed = 0
         for grp in groups:
-            # 1) 删除国服查不到的道具（一个 rule 里多个道具只删不存在的）
+            # 1) 删除国服查不到的道具（一个 rule 里多个道具只删不存在的；白名单保留）
             for bt in list(grp["currencies"]):
-                if normalize_name(bt) not in cn_prices:
+                if normalize_name(bt) not in cn_prices and normalize_name(bt) not in keep_norm:
                     old_tier = grp["currencies"][bt]["base"]
                     del grp["currencies"][bt]
                     total_removed += 1
