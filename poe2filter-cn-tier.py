@@ -3,42 +3,40 @@
 """
 poe2filter-cn-tier.py — POE2 过滤器国服通货重分级工具
 
-用国服（poecurrency.top）的通货价格，把 poe2filter.com 导出的国际服过滤器里
-所有「通货类」物品（通货/催化剂/合金/符文/精华/预兆/灵核/矿石…）的 tier
-（S/A/B/C/D/E/F）按国服物价重新分级。
+把国际服过滤器（poe2filter.com 或 filterblade/NeverSink）里的通货类物品，
+按国服物价重新分档。
+
+核心思路（相对判定）：
+  1. 用国际服价（poe.ninja）算出原过滤器每档的上下限（档内最贵/最便宜道具）
+  2. 相邻两档分界点 = (上一档下界 + 下一档上界) / 2
+  3. 用国服价（poecurrency.top）相对分界点重新落档
+  4. C/D/E 三个标志通货（混沌/神圣/崇高石）钉在原档位不动
+  5. 查不到的通货保留原档
 
 用法示例：
-    # 全部用默认值（路径/输出/档位都默认，自动读同目录 config）
+    # 默认（poe2filter 格式，自动读同目录 config）
     python3 poe2filter-cn-tier.py
 
-    # 指定输入、输出、档位
-    python3 poe2filter-cn-tier.py --filter "D:/My Games/Path of Exile 2/poe2filter.filter" \
-                                   --output "D:/poe2filter-cn.filter" \
-                                   --level "very strict"
+    # 指定输入/输出
+    python3 poe2filter-cn-tier.py --filter "D:/xxx.filter" --output "D:/xxx-cn.filter"
 
-    # 携带 API Token（可选；无 token 时用免费 summary 接口）
+    # filterblade (NeverSink) 格式
+    python3 poe2filter-cn-tier.py --filter "xxx.filter" --format filterblade
+
+    # 携带 API Token（可选；无 token 用免费 summary 接口）
     python3 poe2filter-cn-tier.py --token ***
 
-    # 更省事：在脚本同目录放一个 poe2filter-cn-tier-config.py，里面写
-    #     API_TOKEN = "***"
-    # 脚本会自动 import 读取，就不用每次敲 --token ***
+    # 更省事：同目录放 poe2filter-cn-tier-config.py，里面写 API_TOKEN = "***"
 
 参数（均可选）：
     --filter PATH   过滤器路径。默认：<用户目录>/Documents/My Games/Path of Exile 2/poe2filter.filter
-    --output PATH   输出路径。默认：同名文件 + "-cn" 后缀（如 poe2filter-cn.filter）
-    --level STR     分级档位：very strict / strict / normal / early-game / all（默认 all，一次性导出全部）。
-    --token ***     poecurrency.top 的 API Token（可选，优先于 config 文件）。
-    --price-field   取值字段，默认 buy_avg（可选 buy_avg / sell_avg / latest_buy1 / latest_sell1）。
-    --verbose       打印每件物品的详细对照表（默认只打印每段汇总）。
+    --output PATH   输出路径。默认：同名文件 + "-cn" 后缀
+    --format STR    过滤器格式：poe2filter（默认）/ filterblade
+    --token ***     poecurrency.top 的 API Token（可选，优先于 config 文件）
+    --price-field   取值字段，默认 buy_avg
+    --verbose       打印每件物品的详细对照表
 
-    API Token 读取优先级：命令行 --token *** 同目录 poe2filter-cn-tier-config.py 里的 API_TOKEN > 无（免费接口）。
-
-分级规则（单件价值；单位：C=混沌石 Chaos Orb，D=神圣石 Divine Orb，E=崇高石 Exalted Orb）：
-    very strict : S>=10D  A>=3D  B>=1D   C>=2C   D~1C    E<0.5C   F<0.1C
-    strict      : S>=3D   A>=1D  B>=2C   C~1C   D<0.5C  E<0.1C   F<0.05C
-    normal      : S>=100E A>=15E B>=3E   C~1E   D<0.5E  E<0.1E   F<0.01E
-    early-game  : S>=20E  A>=2.5E B~1E   C<0.75E D<0.2E  E<0.1E   F<0.001E
-    （"~" 表示中间档，落在上下两档之间；各档具体下界见脚本内 LEVELS 字典）
+    API Token 优先级：--token *** 同目录 config 的 API_TOKEN > 无（免费接口）
 """
 
 import argparse
