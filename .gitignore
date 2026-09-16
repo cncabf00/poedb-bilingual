@@ -1,2 +1,6 @@
 # 本地密钥配置文件（含 API Token），不要提交
 poe2filter-cn-tier-config.py
+
+# 国际服物价备份表（本地生成的快照，会变化，不要提交）
+intl-poe1.json
+intl-poe2.json

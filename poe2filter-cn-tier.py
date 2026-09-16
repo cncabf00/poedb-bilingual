@@ -51,6 +51,7 @@ import importlib.util
 import json
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -235,6 +236,39 @@ def _index_items(data):
             if eng:
                 index[normalize_name(eng)] = item
     return index
+
+
+# ============================== 国际服物价备份表 ==============================
+
+def intl_backup_path(game):
+    """国际服物价备份表路径（脚本同目录）。"""
+    return Path(__file__).resolve().parent / f"intl-{game}.json"
+
+
+def load_intl_backup(game):
+    """读国际服物价备份表。返回 (prices_dict, mtime_float)；不存在/损坏返回 (None, None)。"""
+    p = intl_backup_path(game)
+    if not p.exists():
+        return None, None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        prices = data.get("prices", {})
+        if not isinstance(prices, dict):
+            return None, None
+        return prices, p.stat().st_mtime
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def save_intl_backup(game, league, prices):
+    """写国际服物价备份表（记录当时的国际服价快照）。"""
+    p = intl_backup_path(game)
+    data = {
+        "league": league,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "prices": prices,
+    }
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # ============================== 价值折算 ==============================
@@ -920,12 +954,26 @@ def main(argv=None):
             print(f"[错误] {game} 抓取国服价失败：{e}，跳过")
             continue
         print(f"[国服] 1 神圣 ≈ {anchors['divine_in_chaos']:.2f} 混沌")
-        try:
-            intl_prices = poe_ninja.fetch_international_prices(game)
-        except Exception as e:  # noqa: BLE001
-            print(f"[错误] {game} 抓取国际服价失败：{e}，跳过")
-            continue
-        print(f"[国际服] 抓到 {len(intl_prices)} 个通货价格")
+
+        # 2.5 国际服价：过滤器比备份表新才拉最新（多对一，任意一个新就算）
+        newest_mtime = max(f.stat().st_mtime for f in filter_files)
+        backup_prices, backup_mtime = load_intl_backup(game)
+        if backup_prices is None or newest_mtime > backup_mtime:
+            try:
+                league = poe_ninja.get_current_league(game)
+                intl_prices = poe_ninja.fetch_international_prices(game, league)
+                save_intl_backup(game, league, intl_prices)
+                print(f"[国际服] 拉到最新 {len(intl_prices)} 个通货价格，已更新备份表")
+            except Exception as e:  # noqa: BLE001
+                if backup_prices is not None:
+                    intl_prices = backup_prices
+                    print(f"[WARN] 抓取国际服价失败（{e}），回退用备份表 {len(intl_prices)} 个价格")
+                else:
+                    print(f"[错误] {game} 抓取国际服价失败：{e}，跳过")
+                    continue
+        else:
+            intl_prices = backup_prices
+            print(f"[国际服] 使用备份表 {len(intl_prices)} 个通货价格（过滤器未更新）")
 
         # 3. 逐个文件处理
         for filter_path in filter_files:
