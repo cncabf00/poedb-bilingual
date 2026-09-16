@@ -50,52 +50,16 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import poe_ninja
+
 # ============================== 配置 ==============================
 
 API_BASE = "https://poecurrency.top"
 
-# 分级档位。每个 tier 的价值下界（自上而下匹配），单位三种：
-#   "divine" = 神圣石(D)、"chaos" = 混沌石(C)、"exalted" = 崇高石(E)。
-# 每个档的阈值保持「原生单位」，不把 D 档换算成 C/E 再去比。
-# 注："~1C" 这类中间档，其下界取下一档的上界（如 [0.5C, 2C)），即无缝隙分区。
-LEVELS = {
-    "very strict": {
-        "S": ("divine", 10),
-        "A": ("divine", 3),
-        "B": ("divine", 1),
-        "C": ("chaos", 2),
-        "D": ("chaos", 0.5),
-        "E": ("chaos", 0.1),
-        "F": ("chaos", 0.0),
-    },
-    "strict": {
-        "S": ("divine", 3),
-        "A": ("divine", 1),
-        "B": ("chaos", 2),
-        "C": ("chaos", 0.5),
-        "D": ("chaos", 0.1),
-        "E": ("chaos", 0.05),
-        "F": ("chaos", 0.0),
-    },
-    "normal": {
-        "S": ("exalted", 100),
-        "A": ("exalted", 15),
-        "B": ("exalted", 3),
-        "C": ("exalted", 0.5),
-        "D": ("exalted", 0.1),
-        "E": ("exalted", 0.01),
-        "F": ("exalted", 0.0),
-    },
-    "early-game": {
-        "S": ("exalted", 20),
-        "A": ("exalted", 2.5),
-        "B": ("exalted", 0.75),
-        "C": ("exalted", 0.2),
-        "D": ("exalted", 0.1),
-        "E": ("exalted", 0.001),
-        "F": ("exalted", 0.0),
-    },
-}
+# 分级方式改为「相对判定」：不再用固定阈值（原来的 LEVELS 四套绝对值已废弃）。
+# 改为根据原过滤器里每档实际道具的「国际服价」算每档上下限，
+# 相邻两档平均值做分界点，最后用「国服价」相对分界点落档。
+# 详见 compute_boundaries / assign_currency。
 
 TIER_ORDER = ["S", "A", "B", "C", "D", "E", "F"]  # 从高到低
 TIER_RANK = {t: i for i, t in enumerate(TIER_ORDER)}
@@ -121,8 +85,8 @@ CHAOS_NAME = "Chaos Orb"    # C = 混沌石
 DIVINE_NAME = "Divine Orb"  # D = 神圣石
 EXALTED_NAME = "Exalted Orb"  # e 计价基准（崇高石）
 
-# 计价单位 → 锚定通货（特殊规则用）
-UNIT_ANCHOR = {"divine": DIVINE_NAME, "chaos": CHAOS_NAME, "exalted": EXALTED_NAME}
+# 锚定通货（相对判定里，这三个标志通货钉在原档位，不随汇率浮动）
+ANCHOR_NAMES = {CHAOS_NAME, DIVINE_NAME, EXALTED_NAME}
 
 # 要处理的区域：从 "Tiered Currency Rules" 之后，到 "Bottom Free-text Rules" 之前。
 # 之前的 Uniques/Gear/Jewellery 等装备段、以及 "Currency Rules"（Gold 规则）都不处理。
@@ -253,58 +217,69 @@ def value_in_e(item, divine_in_e, price_fields):
     return None
 
 
-# ============================== 分级 ==============================
+# ============================== 分级（相对判定） ==============================
 
-def tier_of(values, level):
-    """按价值分级。values: {"divine": float, "chaos": float, "exalted": float}
+def compute_boundaries(section_items, intl_prices):
+    """根据国际服价计算相邻档位的分界点。
 
-    分级标准保持「原生单位」：各档用各自的计价单位（divine/chaos/exalted）直接比较，
-    不把标准换算成别的单位再去比——因为单位间的汇率是浮动的，而标准应该钉死在原单位上。
+    section_items: {name: original_tier}（某个段/组里的通货及其原档位）
+    intl_prices:   {name: 国际服混沌价}
+    返回 [(boundary_value, higher_tier, lower_tier)]，按 value 从高到低。
+
+    规则：每档上下限 = 档内最贵/最便宜道具的国际服价（最高档无上限、最低档无下限）；
+    相邻两档分界点 = (上一档下界 + 下一档上界) / 2。
     """
-    thresholds = LEVELS[level]
-    for tier in TIER_ORDER:
-        unit, thresh = thresholds[tier]
-        if values[unit] >= thresh:
-            return tier
-    return "F"  # 理论上到不了这里
+    tier_vals = {}
+    for name, tier in section_items.items():
+        v = intl_prices.get(name)
+        if v is None or tier not in TIER_RANK:
+            continue
+        tier_vals.setdefault(tier, []).append(v)
+
+    tier_bounds = {t: (min(vs), max(vs)) for t, vs in tier_vals.items()}
+
+    boundaries = []
+    for i in range(len(TIER_ORDER) - 1):
+        high, low = TIER_ORDER[i], TIER_ORDER[i + 1]
+        if high not in tier_bounds or low not in tier_bounds:
+            continue  # 空档跳过
+        b = (tier_bounds[high][0] + tier_bounds[low][1]) / 2
+        boundaries.append((b, high, low))
+    return boundaries
 
 
-def compute_assignment(values, level, stackable=True, pin_base=None):
-    """给定单件价值（含 divine/chaos/exalted 三个量纲），返回 (base_tier, [(N, target), ...])。
+def relative_tier(value, boundaries):
+    """按分界点判定档位。value 是国服混沌价。"""
+    for b, high, _low in boundaries:  # 从高到低
+        if value >= b:
+            return high
+    return boundaries[-1][2] if boundaries else None
 
-    pin_base：锚定档位（特殊规则）。若该通货是某档的计价通货且原在该档，
-    则固定其 base 为该档，不随国服汇率浮动；堆叠升档仍按 N×价值重新计算。
 
-    堆叠规则：poe2filter.com 会把“大额堆叠”视为总价值更高，从而升档。
-    这里按 N∈{3,5,10,20} 检查 N×单件价值 是否跨入更高 tier。
-    仅 stackable（可堆叠通货）才计算堆叠升档。
+def assign_currency(name, cn_value, original_tier, boundaries, stackable):
+    """判定单个通货的新档位 + 堆叠升档。
+
+    锚定规则：C/D/E 三个标志通货钉在原档位；查不到的保留原档。
+    堆叠升档：仅 stackable 通货，按 N×国服价 看是否跨入更高档。
     """
-    base = pin_base if pin_base else tier_of(values, level)
+    if name in ANCHOR_NAMES or cn_value is None:
+        base = original_tier
+    else:
+        base = relative_tier(cn_value, boundaries)
+        if base is None:
+            base = original_tier
+
     promotions = []
-    if stackable:
+    if stackable and cn_value is not None:
         prev = base
         for n in sorted(STACK_CHECKPOINTS):  # 3,5,10,20 升序
-            n_values = {u: v * n for u, v in values.items()}
-            t = tier_of(n_values, level)
+            t = relative_tier(n * cn_value, boundaries)
+            if t is None:
+                continue
             if TIER_RANK[t] < TIER_RANK[prev]:  # t 比 prev 更高档
                 promotions.append((n, t))
                 prev = t
     return base, promotions
-
-
-def compute_pins(original_base, level):
-    """特殊规则：某档按其计价的通货，若原在该档，则国服仍留该档。
-
-    original_base: {currency_name: original_tier}（来自输入过滤器的原始分级）
-    返回 pins: {anchor_name: tier}，锚定通货 → 固定档位。
-    """
-    pins = {}
-    for tier in TIER_ORDER:
-        unit, _ = LEVELS[level][tier]
-        anchor = UNIT_ANCHOR[unit]
-        if original_base.get(anchor) == tier:
-            pins[anchor] = tier
-    return pins
 
 
 # ============================== 过滤器解析 ==============================
@@ -513,33 +488,18 @@ def regenerate_section(groups, tier_display, new_assignment):
 
 # ============================== 主流程 ==============================
 
-def make_output_path(filter_path, explicit_output, level):
-    """生成输出路径。level 会以 slug 形式加进文件名（空格→连字符）。"""
-    slug = level.replace(" ", "-")
+def make_output_path(filter_path, explicit_output):
+    """生成输出路径。默认同名 + -cn 后缀。"""
     if explicit_output:
-        p = Path(explicit_output).expanduser()
-        stem = p.stem
-    else:
-        p = Path(filter_path).expanduser()
-        stem = p.stem + "-cn"
-    suffix = p.suffix
-    return p.with_name(f"{stem}-{slug}{suffix}")
+        return Path(explicit_output).expanduser()
+    p = Path(filter_path).expanduser()
+    return p.with_name(p.stem + "-cn" + p.suffix)
 
 
-def process_level(level, lines, parsed, global_tier_display, prices, anchors,
-                  price_fields, output_path, verbose):
-    """对单个 level：重新分级 → 打印汇总 → 重新生成并写文件。"""
-    chaos_in_e, divine_in_e = anchors
-
-    # 特殊规则：某档按其计价的通货，若原在该档，则固定其档位（不随国服汇率浮动）
-    original_base = {}
-    for _title, _start, _end, groups in parsed:
-        for grp in groups:
-            for bt, rec in grp["currencies"].items():
-                original_base[bt] = rec["base"]
-    pins = compute_pins(original_base, level)
-
-    # 1) 对每个通货重新分级（全局价格查询）
+def process_format(lines, parsed, global_tier_display, cn_prices, intl_prices,
+                   chaos_in_e, divine_in_e, price_fields, output_path, verbose):
+    """相对判定重新分级 → 打印汇总 → 重新生成并写文件。"""
+    # 1) 对每个段/组重新分级（相对判定）
     new_assignments = {}
     total_items = 0
     total_changed = 0
@@ -551,50 +511,33 @@ def process_level(level, lines, parsed, global_tier_display, prices, anchors,
         n_changed = 0
         for grp in groups:
             stackable = grp["class"] == "Stackable Currency"
+            section_items = {bt: rec["base"] for bt, rec in grp["currencies"].items()}
+            boundaries = compute_boundaries(section_items, intl_prices)
             for bt, old_rec in grp["currencies"].items():
                 n_items += 1
-                item = prices.get(bt)
-                if item is None:
-                    # API 查不到：保留原分级
-                    new_assignments[bt] = {
-                        "base": old_rec["base"],
-                        "promotions": list(old_rec["promotions"]),
-                    }
-                    detail_rows.append((title, bt, old_rec["base"], old_rec["base"], None, "查不到，保留"))
-                    continue
-
-                ve = value_in_e(item, divine_in_e, price_fields)
-                if ve is None:
-                    new_assignments[bt] = {
-                        "base": old_rec["base"],
-                        "promotions": list(old_rec["promotions"]),
-                    }
-                    detail_rows.append((title, bt, old_rec["base"], old_rec["base"], None, "无价格，保留"))
-                    continue
-
-                values = {
-                    "divine": ve / divine_in_e,
-                    "chaos": ve / chaos_in_e,
-                    "exalted": ve,
-                }
-                base, promotions = compute_assignment(
-                    values, level, stackable=stackable, pin_base=pins.get(bt)
+                item = cn_prices.get(bt)
+                cn_value = None
+                if item is not None:
+                    ve = value_in_e(item, divine_in_e, price_fields)
+                    if ve is not None:
+                        cn_value = ve / chaos_in_e
+                base, promotions = assign_currency(
+                    bt, cn_value, old_rec["base"], boundaries, stackable
                 )
                 new_assignments[bt] = {"base": base, "promotions": promotions}
 
                 if base != old_rec["base"]:
                     n_changed += 1
                 proms_str = ", ".join(f"{n}+→{t}" for n, t in promotions) or "-"
-                detail_rows.append(
-                    (title, bt, old_rec["base"], base, round(values["chaos"], 3), proms_str)
-                )
+                vc = round(cn_value, 3) if cn_value is not None else None
+                detail_rows.append((title, bt, old_rec["base"], base, vc, proms_str))
 
         total_items += n_items
         total_changed += n_changed
         section_summary.append((title, n_items, n_changed))
 
     # 2) 打印汇总
-    print(f"\n=== [{level}] 各段重新分级汇总 ===")
+    print("\n=== 各段重新分级汇总 ===")
     print(f"{'段':<24}{'物品数':>6}{'变动数':>8}")
     for title, n_items, n_changed in section_summary:
         print(f"{title:<24}{n_items:>6}{n_changed:>8}")
@@ -636,8 +579,8 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--filter", default=str(DEFAULT_FILTER), help="过滤器路径")
-    parser.add_argument("--output", default=None, help="输出路径（默认同名 + -cn-{level} 后缀）")
-    parser.add_argument("--level", default="all", help="分级档位（very strict / strict / normal / early-game / all，默认 all）")
+    parser.add_argument("--output", default=None, help="输出路径（默认同名 + -cn 后缀）")
+    parser.add_argument("--format", default="poe2filter", choices=["poe2filter", "filterblade"], help="过滤器格式（默认 poe2filter）")
     parser.add_argument("--token", default=None, help="poecurrency.top API Token（可选，优先于 config 文件）")
     parser.add_argument(
         "--price-field",
@@ -648,9 +591,6 @@ def main(argv=None):
     parser.add_argument("--verbose", action="store_true", help="打印每件物品的详细对照表")
     args = parser.parse_args(argv)
 
-    if args.level != "all" and args.level not in LEVELS:
-        sys.exit(f"[错误] 档位 '{args.level}' 不支持。可选: all / {', '.join(LEVELS)}")
-
     # 取值字段顺序：用户选的字段排最前，其余兜底
     price_fields = [args.price_field] + [f for f in PRICE_FIELDS if f != args.price_field]
 
@@ -660,45 +600,44 @@ def main(argv=None):
         sys.exit(f"[错误] 找不到过滤器文件：{filter_path}")
     lines = filter_path.read_text(encoding="utf-8").split("\n")
 
-    # 2. 定位要处理的段
+    # 2. 拉取价格（国服 + 国际服）
+    token = args.token if args.token else load_api_token()
+    cn_prices = fetch_prices(token)
+    chaos_in_e, divine_in_e = compute_anchors(cn_prices, price_fields)
+    print(
+        f"[国服] 1 混沌 ≈ {chaos_in_e} e, 1 神圣 ≈ {divine_in_e} e "
+        f"(1 神圣 ≈ {divine_in_e / chaos_in_e:.2f} 混沌)"
+    )
+    intl_prices = poe_ninja.fetch_international_prices()
+    print(f"[国际服] 抓到 {len(intl_prices)} 个通货价格")
+
+    # 3. 定位并解析段
+    if args.format == "filterblade":
+        sys.exit("[错误] filterblade 支持开发中，暂只支持 poe2filter")
     sections = locate_sections(lines)
     if not sections:
         sys.exit(f"[错误] 未找到 '{AREA_START}' 区域，过滤器结构可能不匹配")
 
-    # 3. 拉取价格并计算锚点
-    token = args.token if args.token else load_api_token()
-    prices = fetch_prices(token)
-    chaos_in_e, divine_in_e = compute_anchors(prices, price_fields)
-    print(
-        f"[锚点] 1 混沌 ≈ {chaos_in_e} e, 1 神圣 ≈ {divine_in_e} e "
-        f"(1 神圣 ≈ {divine_in_e / chaos_in_e:.2f} 混沌)"
-    )
-
-    # 4. 解析所有段（收集全局 tier 展示样式 + 各段分组）
     parsed = []  # (title, start, end, groups)
     global_tier_display = {}
     for title, start, end in sections:
         groups, tier_display = parse_section(lines[start + 1 : end])
         if not groups:
             continue
-        # 跳过完全查不到的段（0% 覆盖，如 Uncut Gems/Tablets/Vault Keys 等），保持原样
-        has_match = any(bt in prices for grp in groups for bt in grp["currencies"])
+        # 跳过完全查不到的段（0% 覆盖），保持原样
+        has_match = any(bt in cn_prices for grp in groups for bt in grp["currencies"])
         if not has_match:
             continue
         for tier, meta in tier_display.items():
             global_tier_display.setdefault(tier, meta)
         parsed.append((title, start, end, groups))
 
-    # 5. 对每个 level 重新分级并写文件（"all" 时一次性导出所有档位）
-    levels = list(LEVELS.keys()) if args.level == "all" else [args.level]
-    anchors = (chaos_in_e, divine_in_e)
-    for level in levels:
-        output_path = make_output_path(filter_path, args.output, level)
-        print(f"\n{'=' * 16} 档位: {level} {'=' * 16}")
-        process_level(
-            level, lines, parsed, global_tier_display, prices, anchors,
-            price_fields, output_path, args.verbose,
-        )
+    # 4. 重新分级并写回
+    output_path = make_output_path(filter_path, args.output)
+    process_format(
+        lines, parsed, global_tier_display, cn_prices, intl_prices,
+        chaos_in_e, divine_in_e, price_fields, output_path, args.verbose,
+    )
 
 
 if __name__ == "__main__":
