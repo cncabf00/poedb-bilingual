@@ -121,6 +121,9 @@ CHAOS_NAME = "Chaos Orb"    # C = 混沌石
 DIVINE_NAME = "Divine Orb"  # D = 神圣石
 EXALTED_NAME = "Exalted Orb"  # e 计价基准（崇高石）
 
+# 计价单位 → 锚定通货（特殊规则用）
+UNIT_ANCHOR = {"divine": DIVINE_NAME, "chaos": CHAOS_NAME, "exalted": EXALTED_NAME}
+
 # 要处理的区域：从 "Tiered Currency Rules" 之后，到 "Bottom Free-text Rules" 之前。
 # 之前的 Uniques/Gear/Jewellery 等装备段、以及 "Currency Rules"（Gold 规则）都不处理。
 AREA_START = "Tiered Currency Rules"
@@ -266,14 +269,17 @@ def tier_of(values, level):
     return "F"  # 理论上到不了这里
 
 
-def compute_assignment(values, level, stackable=True):
+def compute_assignment(values, level, stackable=True, pin_base=None):
     """给定单件价值（含 divine/chaos/exalted 三个量纲），返回 (base_tier, [(N, target), ...])。
+
+    pin_base：锚定档位（特殊规则）。若该通货是某档的计价通货且原在该档，
+    则固定其 base 为该档，不随国服汇率浮动；堆叠升档仍按 N×价值重新计算。
 
     堆叠规则：poe2filter.com 会把“大额堆叠”视为总价值更高，从而升档。
     这里按 N∈{3,5,10,20} 检查 N×单件价值 是否跨入更高 tier。
     仅 stackable（可堆叠通货）才计算堆叠升档。
     """
-    base = tier_of(values, level)
+    base = pin_base if pin_base else tier_of(values, level)
     promotions = []
     if stackable:
         prev = base
@@ -284,6 +290,21 @@ def compute_assignment(values, level, stackable=True):
                 promotions.append((n, t))
                 prev = t
     return base, promotions
+
+
+def compute_pins(original_base, level):
+    """特殊规则：某档按其计价的通货，若原在该档，则国服仍留该档。
+
+    original_base: {currency_name: original_tier}（来自输入过滤器的原始分级）
+    返回 pins: {anchor_name: tier}，锚定通货 → 固定档位。
+    """
+    pins = {}
+    for tier in TIER_ORDER:
+        unit, _ = LEVELS[level][tier]
+        anchor = UNIT_ANCHOR[unit]
+        if original_base.get(anchor) == tier:
+            pins[anchor] = tier
+    return pins
 
 
 # ============================== 过滤器解析 ==============================
@@ -510,6 +531,14 @@ def process_level(level, lines, parsed, global_tier_display, prices, anchors,
     """对单个 level：重新分级 → 打印汇总 → 重新生成并写文件。"""
     chaos_in_e, divine_in_e = anchors
 
+    # 特殊规则：某档按其计价的通货，若原在该档，则固定其档位（不随国服汇率浮动）
+    original_base = {}
+    for _title, _start, _end, groups in parsed:
+        for grp in groups:
+            for bt, rec in grp["currencies"].items():
+                original_base[bt] = rec["base"]
+    pins = compute_pins(original_base, level)
+
     # 1) 对每个通货重新分级（全局价格查询）
     new_assignments = {}
     total_items = 0
@@ -548,7 +577,9 @@ def process_level(level, lines, parsed, global_tier_display, prices, anchors,
                     "chaos": ve / chaos_in_e,
                     "exalted": ve,
                 }
-                base, promotions = compute_assignment(values, level, stackable=stackable)
+                base, promotions = compute_assignment(
+                    values, level, stackable=stackable, pin_base=pins.get(bt)
+                )
                 new_assignments[bt] = {"base": base, "promotions": promotions}
 
                 if base != old_rec["base"]:
