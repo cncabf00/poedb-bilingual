@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-poe2filter-cn-tier.py — POE2 过滤器国服通货重分级工具
+poe2filter-cn-tier.py — POE 过滤器国服通货重分级工具（支持 POE1 / POE2）
 
 把国际服过滤器（poe2filter.com 或 filterblade/NeverSink）里的通货类物品，
-按国服物价重新分档。
+按国服物价重新分档，并删掉国服查不到的道具（防过滤器导入国服后加载失败）。
 
 核心思路（相对判定）：
   1. 用国际服价（poe.ninja）算出原过滤器每档的上下限（档内最贵/最便宜道具）
   2. 相邻两档分界点 = (上一档下界 + 下一档上界) / 2
   3. 用国服价（poecurrency.top）相对分界点重新落档
   4. C/D/E 三个标志通货（混沌/神圣/崇高石）钉在原档位不动
-  5. 查不到的通货保留原档
+  5. 国服查不到的道具直接删除（国际服比国服多出的物品）
 
 用法示例：
-    # 默认（poe2filter 格式，自动读同目录 config）
+    # 默认：同时处理 POE1 + POE2 默认目录（自动扫 .filter，排除 -cn，自动识别格式）
     python3 poe2filter-cn-tier.py
 
-    # 指定输入/输出
-    python3 poe2filter-cn-tier.py --filter "D:/xxx.filter" --output "D:/xxx-cn.filter"
+    # 只处理某一代
+    python3 poe2filter-cn-tier.py --game poe1
 
-    # filterblade (NeverSink) 格式
-    python3 poe2filter-cn-tier.py --filter "xxx.filter" --format filterblade
+    # 指定目录（测试用）
+    python3 poe2filter-cn-tier.py --poe1-dir "D:/p1" --poe2-dir "D:/p2"
+
+    # 单个文件（自动识别格式）
+    python3 poe2filter-cn-tier.py --filter "D:/xxx.filter"
 
     # 携带 API Token（可选；无 token 用免费 summary 接口）
     python3 poe2filter-cn-tier.py --token ***
@@ -29,14 +32,18 @@ poe2filter-cn-tier.py — POE2 过滤器国服通货重分级工具
     # 更省事：同目录放 poe2filter-cn-tier-config.py，里面写 API_TOKEN = "***"
 
 参数（均可选）：
-    --filter PATH   过滤器路径。默认：<用户目录>/Documents/My Games/Path of Exile 2/poe2filter.filter
-    --output PATH   输出路径。默认：同名文件 + "-cn" 后缀
-    --format STR    过滤器格式：poe2filter（默认）/ filterblade
+    --game STR      处理哪一代：both（默认）/ poe1 / poe2
+    --poe1-dir PATH POE1 过滤器目录（默认 Documents/My Games/Path of Exile）
+    --poe2-dir PATH POE2 过滤器目录（默认 Documents/My Games/Path of Exile 2）
+    --filter PATH   单个过滤器文件（可选，指定后只处理这一个）
+    --output PATH   单文件模式的输出路径（默认同名 + -cn 后缀）
+    --format STR    过滤器格式：auto（默认自动识别）/ poe2filter / filterblade
     --token ***     poecurrency.top 的 API Token（可选，优先于 config 文件）
     --price-field   取值字段，默认 buy_avg
     --verbose       打印每件物品的详细对照表
 
-    API Token 优先级：--token *** 同目录 config 的 API_TOKEN > 无（免费接口）
+    说明：POE1 只支持 filterblade（NeverSink）；poe2filter.com 无一代版本。
+    API Token 优先级：--token *** > 同目录 config 的 API_TOKEN > 无（免费接口）
 """
 
 import argparse
@@ -69,10 +76,11 @@ STACK_CHECKPOINTS = [3, 5, 10, 20]
 # 取值字段的兜底顺序（买1均价 → 卖均价 → 最新买1 → 最新卖1）。
 PRICE_FIELDS = ["buy_avg", "sell_avg", "latest_buy1", "latest_sell1"]
 
-# 默认过滤器路径（Windows 文档目录）。
-DEFAULT_FILTER = (
-    Path.home() / "Documents" / "My Games" / "Path of Exile 2" / "poe2filter.filter"
-)
+# 默认过滤器目录（Windows 文档目录）。POE1 与 POE2 各自一个。
+DEFAULT_DIRS = {
+    "poe1": Path.home() / "Documents" / "My Games" / "Path of Exile",
+    "poe2": Path.home() / "Documents" / "My Games" / "Path of Exile 2",
+}
 
 # 本地配置文件（与脚本同目录，可选）：里面定义 API_TOKEN = "***"，脚本会自动 import 读取。
 # 该文件含密钥，不要提交到公开仓库。
@@ -127,16 +135,18 @@ def http_get_json(url, timeout=30):
     return json.loads(data)
 
 
-def fetch_prices(token=None):
-    """拉取国服 POE2 通货价格。返回 {engname: item, ...}。
+def fetch_prices(game, token=None):
+    """拉取国服 POE 通货价格。返回 {engname: item, ...}。
 
+    game: "poe1"（version=1）或 "poe2"（version=2）。
     token 为空时用 /api/summary（免费、1 小时缓存、无需鉴权）；
     有 token 时优先用 /api/summary_validate（带异常点剔除），401 则回退 summary。
     """
-    summary_url = f"{API_BASE}/api/summary?version=2"
+    version = "1" if game == "poe1" else "2"
+    summary_url = f"{API_BASE}/api/summary?version={version}"
 
     if token:
-        validate_url = f"{API_BASE}/api/summary_validate?version=2&token={token}"
+        validate_url = f"{API_BASE}/api/summary_validate?version={version}&token={token}"
         try:
             data = http_get_json(validate_url)
             print("[API] 使用 summary_validate（带异常剔除），token 有效")
@@ -154,14 +164,25 @@ def fetch_prices(token=None):
     return _index_items(data)
 
 
+def normalize_name(name):
+    """归一化英文名用于匹配（去撇号、统一小写）。
+
+    过滤器/poe.ninja 的英文名带撇号（如 Awakener's Orb），而国服 poecurrency.top
+    的 engname 部分不带撇号（如 Awakeners Orb）。归一化后两者可对齐。
+    """
+    if not name:
+        return ""
+    return name.replace("'", "").replace("\u2019", "").lower()
+
+
 def _index_items(data):
-    """把 summary 的嵌套结构拍平成 {engname: item}。"""
+    """把 summary 的嵌套结构拍平成 {归一化英文名: item}。"""
     index = {}
     for group in data:
         for item in group.get("items", []):
             eng = item.get("engname")
             if eng:
-                index[eng] = item
+                index[normalize_name(eng)] = item
     return index
 
 
@@ -175,42 +196,61 @@ def first_nonzero(item, fields):
     return None
 
 
-def compute_anchors(prices, price_fields):
-    """计算归一化锚点：1 混沌 = ? e，1 神圣 = ? e。返回 (chaos_in_e, divine_in_e)。"""
-    chaos_item = prices.get(CHAOS_NAME)
-    divine_item = prices.get(DIVINE_NAME)
-    if not chaos_item or not divine_item:
+def compute_anchors(game, prices, price_fields):
+    """计算 game 相关的折算锚点，返回 dict（把国服价折到「混沌」用）。
+
+    POE2 计价单位 e(崇高)/d(神圣)：
+        {"divine_in_chaos": divine_e/chaos_e, "base_unit": "e", "base_in_chaos": 1/chaos_e}
+    POE1 计价单位 c(混沌)/d(神圣)：
+        {"divine_in_chaos": divine_c, "base_unit": "c", "base_in_chaos": 1.0}
+    """
+    divine_item = prices.get(normalize_name(DIVINE_NAME))
+    if not divine_item:
         raise RuntimeError(
-            f"API 里找不到锚点通货（{CHAOS_NAME} / {DIVINE_NAME}），无法归一化。"
+            f"API 里找不到锚点通货（{DIVINE_NAME}），无法归一化。"
         )
 
+    if game == "poe1":
+        divine_c = first_nonzero(divine_item, price_fields)  # 1 神圣 = ? 混沌
+        if not divine_c:
+            raise RuntimeError(f"锚点通货价格为 0（Divine={divine_c}），无法归一化。")
+        return {"divine_in_chaos": divine_c, "base_unit": "c", "base_in_chaos": 1.0}
+
+    # POE2
+    chaos_item = prices.get(normalize_name(CHAOS_NAME))
+    if not chaos_item:
+        raise RuntimeError(
+            f"API 里找不到锚点通货（{CHAOS_NAME}），无法归一化。"
+        )
     chaos_e = first_nonzero(chaos_item, price_fields)
     divine_e = first_nonzero(divine_item, price_fields)
     if not chaos_e or not divine_e:
         raise RuntimeError(
             f"锚点通货价格为 0（Chaos={chaos_e}, Divine={divine_e}），无法归一化。"
         )
-    return chaos_e, divine_e
+    return {
+        "divine_in_chaos": divine_e / chaos_e,
+        "base_unit": "e",
+        "base_in_chaos": 1.0 / chaos_e,
+    }
 
 
-def value_in_e(item, divine_in_e, price_fields):
-    """计算某通货的单件价值（统一折到 e=崇高石 计价）。返回 float 或 None（无法判定）。
-
-    这一步只是「算价值」，把 d/e 计价统一折到一个中间基准 e；
-    分级标准本身不在这里换算，见 tier_of()。
-    """
+def cn_value_in_chaos(game, item, anchors, price_fields):
+    """把国服某通货折到「混沌」计价。返回 float 或 None（无法判定）。"""
     price = first_nonzero(item, price_fields)
     unit = item.get("currency_unit")
 
     if price is not None:
         if unit == "d":
-            return price * divine_in_e
-        if unit == "e":
-            return price
+            return price * anchors["divine_in_chaos"]
+        if unit == anchors["base_unit"]:
+            return price * anchors["base_in_chaos"]
         return None  # 未知计价单位
 
-    # 价格为 0：特殊处理“崇高石”这个 e 计价基准（其价值 = 1e）
-    if item.get("engname") == EXALTED_NAME:
+    # 价格为 0 的特殊基准通货（作为 1 个基准单位处理）
+    if game == "poe2" and item.get("engname") == EXALTED_NAME:
+        return anchors["base_in_chaos"]
+    if game == "poe1" and item.get("engname") == CHAOS_NAME:
         return 1.0
     return None
 
@@ -592,12 +632,16 @@ def make_output_path(filter_path, explicit_output):
     return p.with_name(p.stem + "-cn" + p.suffix)
 
 
-def re_tier(parsed, cn_prices, intl_prices, chaos_in_e, divine_in_e, price_fields, verbose):
-    """相对判定重新分级（共享逻辑），返回 (new_assignments, total_items, total_changed)。"""
-    # 1) 对每个段/组重新分级（相对判定）
+def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, verbose):
+    """相对判定重新分级（共享逻辑），返回 (new_assignments, total_items, total_changed)。
+
+    处理前先删除「国服查不到」的道具（国际服多出的物品会导致过滤器导入国服后加载失败）。
+    """
     new_assignments = {}
     total_items = 0
     total_changed = 0
+    total_removed = 0
+    removed_rows = []
     section_summary = []
     detail_rows = []
 
@@ -605,17 +649,24 @@ def re_tier(parsed, cn_prices, intl_prices, chaos_in_e, divine_in_e, price_field
         n_items = 0
         n_changed = 0
         for grp in groups:
+            # 1) 删除国服查不到的道具（一个 rule 里多个道具只删不存在的）
+            for bt in list(grp["currencies"]):
+                if normalize_name(bt) not in cn_prices:
+                    old_tier = grp["currencies"][bt]["base"]
+                    del grp["currencies"][bt]
+                    total_removed += 1
+                    removed_rows.append((title, bt, old_tier))
+            if not grp["currencies"]:
+                continue  # 整组删光，跳过
+
+            # 2) 相对判定重新分级
             stackable = grp["class"] == "Stackable Currency"
             section_items = {bt: rec["base"] for bt, rec in grp["currencies"].items()}
             boundaries = compute_boundaries(section_items, intl_prices)
             for bt, old_rec in grp["currencies"].items():
                 n_items += 1
-                item = cn_prices.get(bt)
-                cn_value = None
-                if item is not None:
-                    ve = value_in_e(item, divine_in_e, price_fields)
-                    if ve is not None:
-                        cn_value = ve / chaos_in_e
+                item = cn_prices.get(normalize_name(bt))
+                cn_value = cn_value_in_chaos(game, item, anchors, price_fields)
                 base, promotions = assign_currency(
                     bt, cn_value, old_rec["base"], boundaries, stackable
                 )
@@ -631,7 +682,13 @@ def re_tier(parsed, cn_prices, intl_prices, chaos_in_e, divine_in_e, price_field
         total_changed += n_changed
         section_summary.append((title, n_items, n_changed))
 
-    # 2) 打印汇总
+    # 打印删除信息
+    if removed_rows:
+        print(f"\n[删除] 国服查不到的 {total_removed} 个道具（已移除，防加载失败）:")
+        for title, bt, old_tier in removed_rows:
+            print(f"  - {bt}（原 {old_tier} 档，段「{title}」）")
+
+    # 打印汇总
     print("\n=== 各段重新分级汇总 ===")
     print(f"{'段':<24}{'物品数':>6}{'变动数':>8}")
     for title, n_items, n_changed in section_summary:
@@ -647,7 +704,7 @@ def re_tier(parsed, cn_prices, intl_prices, chaos_in_e, divine_in_e, price_field
 
     print(
         f"[统计] 共 {total_items} 个通货类物品，其中 {total_changed} 个 tier 发生变化，"
-        f"{total_items - total_changed} 个不变"
+        f"{total_items - total_changed} 个不变，删除 {total_removed} 个国服查不到的道具"
     )
 
     return new_assignments, total_items, total_changed
@@ -669,15 +726,103 @@ def regenerate_poe2filter(lines, parsed, tier_display, new_assignments):
     return new_lines
 
 
+def detect_format(lines):
+    """自动识别过滤器格式。返回 "poe2filter" / "filterblade" / None（识别失败）。"""
+    for line in lines[:300]:
+        if "NeverSink" in line or "$type->" in line or "filterblade" in line.lower():
+            return "filterblade"
+        if "poe2filter.com" in line or "### Currency" in line:
+            return "poe2filter"
+    return None
+
+
+def scan_filters(directory):
+    """扫描目录下所有 .filter 文件（排除 -cn 后缀的，即自己生成的）。"""
+    if not directory.is_dir():
+        return []
+    files = []
+    for p in sorted(directory.glob("*.filter")):
+        if p.stem.endswith("-cn"):
+            continue
+        files.append(p)
+    return files
+
+
+def process_one(filter_path, game, args, cn_prices, intl_prices, anchors, price_fields):
+    """处理单个过滤器文件（识别格式 → 解析 → 重分级 → 生成 → 写回）。"""
+    print(f"\n--- 处理: {filter_path.name} ---")
+
+    # 读文件 + 检测行尾
+    raw_bytes = filter_path.read_bytes()
+    crlf = b"\r\n" in raw_bytes
+    raw = raw_bytes.decode("utf-8")
+    lines = [l.rstrip("\r") for l in raw.split("\n")]
+    newline = "\r\n" if crlf else "\n"
+
+    # 识别格式
+    fmt = args.format
+    if fmt == "auto":
+        fmt = detect_format(lines)
+    if fmt is None:
+        print(f"  [跳过] 无法识别格式，不转换")
+        return
+    if fmt == "poe2filter" and game == "poe1":
+        print(f"  [跳过] POE1 不支持 poe2filter 格式")
+        return
+
+    # 按格式解析
+    if fmt == "poe2filter":
+        sections = locate_sections(lines)
+        if not sections:
+            print(f"  [跳过] 未找到 '{AREA_START}' 区域，结构可能不匹配")
+            return
+        parsed = []  # (title, start, end, groups)
+        tier_display = {}
+        for title, start, end in sections:
+            groups, td = parse_section(lines[start + 1 : end])
+            if not groups:
+                continue
+            for tier, meta in td.items():
+                tier_display.setdefault(tier, meta)
+            parsed.append((title, start, end, groups))
+    else:
+        groups, tier_display, blocks = parse_filterblade(lines)
+        parsed = [("filterblade", 0, 0, groups)]
+
+    # 相对判定重新分级（含删除国服查不到的道具）
+    new_assignments, _, _ = re_tier(
+        parsed, cn_prices, intl_prices, game, anchors, price_fields, args.verbose,
+    )
+
+    # 按格式重新生成并写回
+    if fmt == "poe2filter":
+        new_lines = regenerate_poe2filter(lines, parsed, tier_display, new_assignments)
+    else:
+        new_lines = regenerate_filterblade(lines, groups, tier_display, blocks, new_assignments)
+    output_path = make_output_path(filter_path, args.output if args.filter else None)
+    output_path.write_text(newline.join(new_lines), encoding="utf-8")
+    print(f"  [完成] 输出：{output_path}")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="POE2 过滤器国服通货重分级工具",
+        description="POE 过滤器国服通货重分级工具（支持 POE1 / POE2）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--filter", default=str(DEFAULT_FILTER), help="过滤器路径")
-    parser.add_argument("--output", default=None, help="输出路径（默认同名 + -cn 后缀）")
-    parser.add_argument("--format", default="poe2filter", choices=["poe2filter", "filterblade"], help="过滤器格式（默认 poe2filter）")
-    parser.add_argument("--token", default=None, help="poecurrency.top API Token（可选，优先于 config 文件）")
+    parser.add_argument("--game", default="both", choices=["both", "poe1", "poe2"],
+                        help="处理哪一代（默认 both 两代都处理）")
+    parser.add_argument("--poe1-dir", default=None,
+                        help="POE1 过滤器目录（可选，覆盖默认目录）")
+    parser.add_argument("--poe2-dir", default=None,
+                        help="POE2 过滤器目录（可选，覆盖默认目录）")
+    parser.add_argument("--filter", default=None,
+                        help="单个过滤器文件（可选，指定后只处理这一个）")
+    parser.add_argument("--output", default=None,
+                        help="单文件模式的输出路径（可选，默认同名 + -cn 后缀）")
+    parser.add_argument("--format", default="auto", choices=["auto", "poe2filter", "filterblade"],
+                        help="过滤器格式（默认 auto 自动识别）")
+    parser.add_argument("--token", default=None,
+                        help="poecurrency.top API Token（可选，优先于 config 文件）")
     parser.add_argument(
         "--price-field",
         default="buy_avg",
@@ -689,63 +834,51 @@ def main(argv=None):
 
     # 取值字段顺序：用户选的字段排最前，其余兜底
     price_fields = [args.price_field] + [f for f in PRICE_FIELDS if f != args.price_field]
-
-    # 1. 读过滤器
-    filter_path = Path(args.filter).expanduser()
-    if not filter_path.exists():
-        sys.exit(f"[错误] 找不到过滤器文件：{filter_path}")
-    raw_bytes = filter_path.read_bytes()
-    crlf = b"\r\n" in raw_bytes
-    raw = raw_bytes.decode("utf-8")
-    lines = [l.rstrip("\r") for l in raw.split("\n")]
-    newline = "\r\n" if crlf else "\n"
-
-    # 2. 拉取价格（国服 + 国际服）
     token = args.token if args.token else load_api_token()
-    cn_prices = fetch_prices(token)
-    chaos_in_e, divine_in_e = compute_anchors(cn_prices, price_fields)
-    print(
-        f"[国服] 1 混沌 ≈ {chaos_in_e} e, 1 神圣 ≈ {divine_in_e} e "
-        f"(1 神圣 ≈ {divine_in_e / chaos_in_e:.2f} 混沌)"
-    )
-    intl_prices = poe_ninja.fetch_international_prices()
-    print(f"[国际服] 抓到 {len(intl_prices)} 个通货价格")
 
-    # 3. 按格式解析
-    if args.format == "poe2filter":
-        sections = locate_sections(lines)
-        if not sections:
-            sys.exit(f"[错误] 未找到 '{AREA_START}' 区域，过滤器结构可能不匹配")
-        parsed = []  # (title, start, end, groups)
-        tier_display = {}
-        for title, start, end in sections:
-            groups, td = parse_section(lines[start + 1 : end])
-            if not groups:
-                continue
-            # 跳过完全查不到的段（0% 覆盖），保持原样
-            has_match = any(bt in cn_prices for grp in groups for bt in grp["currencies"])
-            if not has_match:
-                continue
-            for tier, meta in td.items():
-                tier_display.setdefault(tier, meta)
-            parsed.append((title, start, end, groups))
-    else:
-        groups, tier_display, blocks = parse_filterblade(lines)
-        parsed = [("filterblade", 0, 0, groups)]
+    games = ["poe1", "poe2"] if args.game == "both" else [args.game]
+    dir_overrides = {"poe1": args.poe1_dir, "poe2": args.poe2_dir}
 
-    # 4. 相对判定重新分级（共享）
-    new_assignments, _, _ = re_tier(
-        parsed, cn_prices, intl_prices, chaos_in_e, divine_in_e, price_fields, args.verbose,
-    )
+    for game in games:
+        print(f"\n{'=' * 62}")
+        print(f"===== 处理 {game.upper()} =====")
+        print('=' * 62)
 
-    # 5. 按格式重新生成并写回
-    if args.format == "poe2filter":
-        new_lines = regenerate_poe2filter(lines, parsed, tier_display, new_assignments)
-    else:
-        new_lines = regenerate_filterblade(lines, groups, tier_display, blocks, new_assignments)
-    output_path = make_output_path(filter_path, args.output)
-    output_path.write_text(newline.join(new_lines), encoding="utf-8")
-    print(f"[完成] 输出：{output_path}")
+        # 1. 确定文件列表
+        if args.filter:
+            filter_files = [Path(args.filter).expanduser()]
+        else:
+            d = dir_overrides[game]
+            directory = Path(d).expanduser() if d else DEFAULT_DIRS[game]
+            filter_files = scan_filters(directory)
+        if not filter_files:
+            print(f"[提示] {game} 没有找到需要处理的 .filter 文件（目录：{directory if not args.filter else '单文件'}）")
+            continue
+        print(f"[扫描] 找到 {len(filter_files)} 个待处理文件:")
+        for fp in filter_files:
+            print(f"  - {fp.name}")
+
+        # 2. 抓价格（国服 + 国际服，每个 game 抓一次）
+        try:
+            cn_prices = fetch_prices(game, token)
+            anchors = compute_anchors(game, cn_prices, price_fields)
+        except Exception as e:  # noqa: BLE001
+            print(f"[错误] {game} 抓取国服价失败：{e}，跳过")
+            continue
+        print(f"[国服] 1 神圣 ≈ {anchors['divine_in_chaos']:.2f} 混沌")
+        try:
+            intl_prices = poe_ninja.fetch_international_prices(game)
+        except Exception as e:  # noqa: BLE001
+            print(f"[错误] {game} 抓取国际服价失败：{e}，跳过")
+            continue
+        print(f"[国际服] 抓到 {len(intl_prices)} 个通货价格")
+
+        # 3. 逐个文件处理
+        for filter_path in filter_files:
+            try:
+                process_one(filter_path, game, args, cn_prices, intl_prices, anchors, price_fields)
+            except Exception as e:  # noqa: BLE001
+                print(f"  [错误] 处理 {filter_path.name} 失败：{e}")
 
 
 if __name__ == "__main__":
