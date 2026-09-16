@@ -4,10 +4,11 @@
 poe2filter-cn-tier.py — POE2 过滤器国服通货重分级工具
 
 用国服（poecurrency.top）的通货价格，把 poe2filter.com 导出的国际服过滤器里
-的通货 tier（S/A/B/C/D/E/F）按国服物价重新分级。
+所有「通货类」物品（通货/催化剂/合金/符文/精华/预兆/灵核/矿石…）的 tier
+（S/A/B/C/D/E/F）按国服物价重新分级。
 
 用法示例：
-    # 全部用默认值（路径/输出/档位都默认）
+    # 全部用默认值（路径/输出/档位都默认，自动读同目录 config）
     python3 poe2filter-cn-tier.py
 
     # 指定输入、输出、档位
@@ -16,20 +17,21 @@ poe2filter-cn-tier.py — POE2 过滤器国服通货重分级工具
                                    --level "very strict"
 
     # 携带 API Token（可选；无 token 时用免费 summary 接口）
-    python3 poe2filter-cn-tier.py --token <你的token>
+    python3 poe2filter-cn-tier.py --token ***
 
     # 更省事：在脚本同目录放一个 poe2filter-cn-tier-config.py，里面写
-    #     API_TOKEN = "你的token"
-    # 脚本会自动 import 读取，就不用每次敲 --token 了。
+    #     API_TOKEN = "***"
+    # 脚本会自动 import 读取，就不用每次敲 --token ***
 
 参数（均可选）：
     --filter PATH   过滤器路径。默认：<用户目录>/Documents/My Games/Path of Exile 2/poe2filter.filter
     --output PATH   输出路径。默认：同名文件 + "-cn" 后缀（如 poe2filter-cn.filter）
     --level STR     分级档位。当前仅支持 "very strict"（默认）。
-    --token STR     poecurrency.top 的 API Token（可选，优先于 config 文件）。
+    --token ***     poecurrency.top 的 API Token（可选，优先于 config 文件）。
     --price-field   取值字段，默认 buy_avg（可选 buy_avg / sell_avg / latest_buy1 / latest_sell1）。
+    --verbose       打印每件物品的详细对照表（默认只打印每段汇总）。
 
-    API Token 读取优先级：命令行 --token > 同目录 poe2filter-cn-tier-config.py 里的 API_TOKEN > 无（免费接口）。
+    API Token 读取优先级：命令行 --token *** 同目录 poe2filter-cn-tier-config.py 里的 API_TOKEN > 无（免费接口）。
 
 分级规则（very strict，单件价值）：
     S: >= 10 神圣石 (Divine Orb)
@@ -73,6 +75,7 @@ TIER_ORDER = ["S", "A", "B", "C", "D", "E", "F"]  # 从高到低
 TIER_RANK = {t: i for i, t in enumerate(TIER_ORDER)}
 
 # 堆叠阈值（从大到小）。poe2filter.com 用这 4 档判断“大额堆叠 → 升档”。
+# 仅对 Class == "Stackable Currency" 的段生效（符文/预兆等不可堆叠）。
 STACK_CHECKPOINTS = [3, 5, 10, 20]
 
 # 取值字段的兜底顺序（买1均价 → 卖均价 → 最新买1 → 最新卖1）。
@@ -83,14 +86,19 @@ DEFAULT_FILTER = (
     Path.home() / "Documents" / "My Games" / "Path of Exile 2" / "poe2filter.filter"
 )
 
-# 本地配置文件（与脚本同目录，可选）：里面定义 API_TOKEN = "..."，脚本会自动 import 读取。
+# 本地配置文件（与脚本同目录，可选）：里面定义 API_TOKEN = "***"，脚本会自动 import 读取。
 # 该文件含密钥，不要提交到公开仓库。
 CONFIG_FILE = "poe2filter-cn-tier-config.py"
 
-# 锚点通货（用于把 e/d 计价统一折算成“混沌”）。
+# 锚点通货（用于把 e/d 计价统一折算）。
 CHAOS_NAME = "Chaos Orb"    # C = 混沌石
 DIVINE_NAME = "Divine Orb"  # D = 神圣石
 EXALTED_NAME = "Exalted Orb"  # e 计价基准（崇高石）
+
+# 要处理的区域：从 "Tiered Currency Rules" 之后，到 "Bottom Free-text Rules" 之前。
+# 之前的 Uniques/Gear/Jewellery 等装备段、以及 "Currency Rules"（Gold 规则）都不处理。
+AREA_START = "Tiered Currency Rules"
+AREA_END = ("Bottom Free-text Rules", "Filter Configuration")
 
 
 # ============================== 数据获取 ==============================
@@ -140,7 +148,7 @@ def fetch_prices(token=None):
         validate_url = f"{API_BASE}/api/summary_validate?version=2&token={token}"
         try:
             data = http_get_json(validate_url)
-            print(f"[API] 使用 summary_validate（带异常剔除），token 有效")
+            print("[API] 使用 summary_validate（带异常剔除），token 有效")
             return _index_items(data)
         except urllib.error.HTTPError as e:
             if e.code == 401:
@@ -191,7 +199,6 @@ def compute_anchors(prices, price_fields):
         raise RuntimeError(
             f"锚点通货价格为 0（Chaos={chaos_e}, Divine={divine_e}），无法归一化。"
         )
-
     return chaos_e, divine_e
 
 
@@ -238,48 +245,57 @@ def tier_of(value_divine, value_chaos, level):
     return "F"  # 理论上到不了这里
 
 
-def compute_assignment(value_divine, value_chaos, level):
+def compute_assignment(value_divine, value_chaos, level, stackable=True):
     """给定单件价值（同时有神圣/混沌两个量纲），返回 (base_tier, [(N, target_tier), ...])。
 
     堆叠规则：poe2filter.com 会把“大额堆叠”视为总价值更高，从而升档。
     这里按 N∈{3,5,10,20} 检查 N×单件价值 是否跨入更高 tier。
+    仅 stackable（可堆叠通货）才计算堆叠升档。
     """
     base = tier_of(value_divine, value_chaos, level)
     promotions = []
-    prev = base
-    for n in sorted(STACK_CHECKPOINTS):  # 3,5,10,20 升序
-        t = tier_of(n * value_divine, n * value_chaos, level)
-        if TIER_RANK[t] < TIER_RANK[prev]:  # t 比 prev 更高档
-            promotions.append((n, t))
-            prev = t
+    if stackable:
+        prev = base
+        for n in sorted(STACK_CHECKPOINTS):  # 3,5,10,20 升序
+            t = tier_of(n * value_divine, n * value_chaos, level)
+            if TIER_RANK[t] < TIER_RANK[prev]:  # t 比 prev 更高档
+                promotions.append((n, t))
+                prev = t
     return base, promotions
 
 
 # ============================== 过滤器解析 ==============================
 
-SECTION_NAME = "### Currency"
+def locate_sections(lines):
+    """定位所有需要处理的段（Tiered Currency Rules 之后、Bottom Free-text Rules 之前）。
 
-
-def locate_section(lines):
-    """定位 '### Currency' 段，返回 (start, end) 区间（end 不含下一段的标题）。"""
-    idx = None
+    返回 [(section_title, start_idx, end_idx), ...]，end 为下一段标题的起始行。
+    """
+    # 收集所有 "### " 段标题
+    headers = []  # (title, index)
     for i, line in enumerate(lines):
-        if line.strip() == SECTION_NAME:
-            idx = i
-            break
-    if idx is None:
-        raise RuntimeError(f"过滤器里找不到 '{SECTION_NAME}' 段")
+        if line.startswith("### ") and "####" not in line:
+            headers.append((line.strip()[4:], i))
+    headers.append(("__END__", len(lines)))
 
-    # 找下一个 "### " 段标题
-    end = idx + 1
-    while end < len(lines) and not lines[end].startswith("### "):
-        end += 1
-    # end-1 是下一段标题上方的 "####...####" 分隔线，属于下一段，不含进来
-    return idx, end - 1
+    result = []
+    in_area = False
+    for k in range(len(headers) - 1):
+        title, start = headers[k]
+        end = headers[k + 1][1]
+        if title == AREA_START:
+            in_area = True
+            continue
+        if title in AREA_END:
+            break
+        if not in_area:
+            continue
+        result.append((title, start, end))
+    return result
 
 
 def parse_blocks(section_lines):
-    """把段内容解析成块列表。每个块: {action, title, lines:[...]}。"""
+    """把段内容解析成块列表。每个块: {action, title, body:[...]}。"""
     blocks = []
     i = 0
     n = len(section_lines)
@@ -293,7 +309,6 @@ def parse_blocks(section_lines):
             while i < n and section_lines[i].strip() != "":
                 body.append(section_lines[i])
                 i += 1
-            # 跳过空行
             while i < n and section_lines[i].strip() == "":
                 i += 1
             blocks.append({"action": action, "title": title, "body": body})
@@ -303,81 +318,92 @@ def parse_blocks(section_lines):
 
 
 def title_info(title):
-    """从块标题解析出 (stack_n, tier)。base 块返回 (None, tier)。"""
-    m = re.match(r"Stacks of (\d+)\+ → ([SABCDEF])-Tier Currency", title)
+    """从块标题解析出 (stack_n, tier, block_name)。
+
+    例: "S-Tier Currency" -> (None, 'S', 'Currency')
+        "Stacks of 20+ → S-Tier Currency" -> (20, 'S', 'Currency')
+    """
+    m = re.match(r"Stacks of (\d+)\+ → ([SABCDEF])-Tier (.+)$", title)
     if m:
-        return int(m.group(1)), m.group(2)
-    m = re.match(r"([SABCDEF])-Tier Currency", title)
+        return int(m.group(1)), m.group(2), m.group(3)
+    m = re.match(r"([SABCDEF])-Tier (.+)$", title)
     if m:
-        return None, m.group(1)
-    return None, None
+        return None, m.group(1), m.group(2)
+    return None, None, None
 
 
-def parse_currency_section(section_lines):
-    """解析段，返回 (class_line, tier_display, original_assignment)。
+def parse_section(section_lines):
+    """解析一个段，返回 (groups, tier_display_partial)。
 
-    - class_line: "  Class == ..." 行
-    - tier_display: {tier: {"action": Show/Hide, "display": [cosmetic 行...]}}
-    - original_assignment: {name: {"base": tier, "promotions": [(N, target), ...]}}
+    groups: [{name, class, currencies: {name: {base, promotions}}}]
+    同一段可能有多个 (name, class) 组（如 Breach 段含 Breach + Breachstones）。
     """
     blocks = parse_blocks(section_lines)
-    class_line = None
-    tier_display = {}
-    assignment = {}
+    groups = {}  # (name, class) -> {name, class, currencies}
+    tier_display = {}  # tier -> {action, display}
 
     for b in blocks:
-        stack_n, tier = title_info(b["title"])
-        if tier is None:
+        stack_n, tier, name = title_info(b["title"])
+        if tier is None or name is None:
             continue
 
+        class_val = None
         base_types = []
         display = []
         for ln in b["body"]:
-            if ln.strip().startswith("Class =="):
-                class_line = ln
-            elif ln.strip().startswith("StackSize"):
-                pass  # 堆叠条件单独记录
-            elif ln.strip().startswith("BaseType =="):
+            s = ln.strip()
+            if s.startswith("Class =="):
+                m = re.search(r'"([^"]+)"', ln)
+                class_val = m.group(1) if m else None
+            elif s.startswith("StackSize"):
+                pass
+            elif s.startswith("BaseType =="):
                 base_types = re.findall(r'"([^"]+)"', ln)
             else:
                 display.append(ln)
 
-        # 记录该 tier 的展示样式（base 块才有权威展示，堆叠块同 tier 复用）
-        if stack_n is None:
-            tier_display[tier] = {"action": b["action"], "display": display}
+        key = (name, class_val)
+        grp = groups.setdefault(
+            key, {"name": name, "class": class_val, "currencies": {}}
+        )
 
-        for name in base_types:
-            rec = assignment.setdefault(name, {"base": None, "promotions": []})
+        # base 块才有权威展示样式（堆叠块同 tier 复用）
+        if stack_n is None:
+            tier_display.setdefault(tier, {"action": b["action"], "display": display})
+
+        for bt in base_types:
+            rec = grp["currencies"].setdefault(bt, {"base": None, "promotions": []})
             if stack_n is None:
                 rec["base"] = tier
             else:
                 rec["promotions"].append((stack_n, tier))
 
-    # 排序每个名字的 promotions（按 N 升序），并去重
-    for rec in assignment.values():
-        rec["promotions"] = sorted(set(rec["promotions"]))
+    # 排序每个通货的 promotions（按 N 升序）并去重
+    for grp in groups.values():
+        for rec in grp["currencies"].values():
+            rec["promotions"] = sorted(set(rec["promotions"]))
 
-    return class_line, tier_display, assignment
+    return list(groups.values()), tier_display
 
 
 # ============================== 重新生成 ==============================
 
-def render_base_block(tier, names, class_line, tier_display):
+def render_base_block(tier, block_name, names, class_line, tier_display):
     """渲染 base tier 块。"""
     meta = tier_display.get(tier, {"action": "Show", "display": []})
     action = meta["action"]
     display = meta["display"]
-    head = f"{action} # {tier}-Tier Currency (currency)"
+    head = f"{action} # {tier}-Tier {block_name} (currency)"
     out = [head, class_line, f'  BaseType == {" ".join(chr(34) + n + chr(34) for n in names)}']
     out.extend(display)
     return out
 
 
-def render_stack_block(n, target, names, class_line, tier_display):
+def render_stack_block(n, target, block_name, names, class_line, tier_display):
     """渲染 'Stacks of N+ → target' 块。"""
     meta = tier_display.get(target, {"action": "Show", "display": []})
     display = meta["display"]
-    head = f"Show # Stacks of {n}+ → {target}-Tier Currency (currency)"
+    head = f"Show # Stacks of {n}+ → {target}-Tier {block_name} (currency)"
     out = [
         head,
         f"  StackSize >= {n}",
@@ -388,31 +414,56 @@ def render_stack_block(n, target, names, class_line, tier_display):
     return out
 
 
-def regenerate_section(class_line, tier_display, new_assignment):
-    """按新的分级结果，重排并生成整段内容。"""
-    # new_assignment: {name: {"base": tier, "promotions": [(N, target), ...]}}
+def regenerate_section(groups, tier_display, new_assignment):
+    """按新的分级结果，重排并生成整段内容。
+
+    groups: [{name, class, currencies}]
+    new_assignment: {currency_name: {"base": tier, "promotions": [(N, target), ...]}}
+    """
     out = []
     for base_tier in TIER_ORDER:
-        group = {name: rec for name, rec in new_assignment.items() if rec["base"] == base_tier}
-        if not group:
+        # 该 tier 下各组的通货（按新的分级结果 new_assignment 分组）
+        tier_groups = []  # (grp, {currency: rec})
+        for grp in groups:
+            sub = {}
+            for bt, orig_rec in grp["currencies"].items():
+                na = new_assignment.get(bt)
+                if na is None:  # 兜底：查不到时保留原分级
+                    na = {"base": orig_rec["base"], "promotions": list(orig_rec["promotions"])}
+                if na["base"] == base_tier:
+                    sub[bt] = na
+            if sub:
+                tier_groups.append((grp, sub))
+        if not tier_groups:
             continue
 
-        # 收集该 base 组里所有“升档”堆叠规则
-        prom_map = {}  # (target, N) -> [names]
-        for name, rec in group.items():
-            for n, target in rec["promotions"]:
-                prom_map.setdefault((target, n), []).append(name)
-
-        # 排序：target 从高到低，N 从大到小
-        ordered = sorted(prom_map.items(), key=lambda kv: (TIER_RANK[kv[0][0]], -kv[0][1]))
-        for (target, n), names in ordered:
-            out.extend(render_stack_block(n, target, sorted(names), class_line, tier_display))
+        # 1) 堆叠升档（仅 Stackable Currency 组）
+        proms = []  # (target, n, block_name, [names])
+        for grp, sub in tier_groups:
+            if grp["class"] != "Stackable Currency":
+                continue
+            pm = {}
+            for bt, rec in sub.items():
+                for n, target in rec["promotions"]:
+                    pm.setdefault((target, n), []).append(bt)
+            for (target, n), names in pm.items():
+                proms.append((target, n, grp["name"], names))
+        proms.sort(key=lambda x: (TIER_RANK[x[0]], -x[1], x[2]))
+        for target, n, name, names in proms:
+            class_line = f'  Class == "Stackable Currency"'
+            out.extend(
+                render_stack_block(n, target, name, sorted(names), class_line, tier_display)
+            )
             out.append("")
 
-        # base 块
-        names = sorted(group.keys())
-        out.extend(render_base_block(base_tier, names, class_line, tier_display))
-        out.append("")
+        # 2) base 块（按组顺序）
+        for grp, sub in tier_groups:
+            class_line = f'  Class == "{grp["class"]}"'
+            names = sorted(sub.keys())
+            out.extend(
+                render_base_block(base_tier, grp["name"], names, class_line, tier_display)
+            )
+            out.append("")
 
     return out
 
@@ -443,12 +494,11 @@ def main(argv=None):
         choices=PRICE_FIELDS,
         help="取值字段（默认 buy_avg）",
     )
+    parser.add_argument("--verbose", action="store_true", help="打印每件物品的详细对照表")
     args = parser.parse_args(argv)
 
     if args.level not in LEVELS:
-        sys.exit(
-            f"[错误] 档位 '{args.level}' 尚未支持。当前支持: {list(LEVELS.keys())}"
-        )
+        sys.exit(f"[错误] 档位 '{args.level}' 尚未支持。当前支持: {list(LEVELS.keys())}")
 
     # 取值字段顺序：用户选的字段排最前，其余兜底
     price_fields = [args.price_field] + [f for f in PRICE_FIELDS if f != args.price_field]
@@ -457,18 +507,14 @@ def main(argv=None):
     filter_path, output_path = resolve_paths(args)
     if not filter_path.exists():
         sys.exit(f"[错误] 找不到过滤器文件：{filter_path}")
-    text = filter_path.read_text(encoding="utf-8")
-    lines = text.split("\n")
+    lines = filter_path.read_text(encoding="utf-8").split("\n")
 
-    # 2. 定位并解析 Currency 段
-    start, end = locate_section(lines)
-    section_lines = lines[start + 1 : end]  # 去掉 "### Currency" 标题行本身
-    class_line, tier_display, original = parse_currency_section(section_lines)
-    if not class_line:
-        sys.exit("[错误] 未能解析出 Class 行，段结构可能异常")
+    # 2. 定位要处理的段
+    sections = locate_sections(lines)
+    if not sections:
+        sys.exit(f"[错误] 未找到 '{AREA_START}' 区域，过滤器结构可能不匹配")
 
     # 3. 拉取价格并计算锚点
-    # token 优先级：命令行 --token > 同目录 config 文件的 API_TOKEN > 无（免费接口）
     token = args.token if args.token else load_api_token()
     prices = fetch_prices(token)
     chaos_in_e, divine_in_e = compute_anchors(prices, price_fields)
@@ -477,61 +523,105 @@ def main(argv=None):
         f"(1 神圣 ≈ {divine_in_e / chaos_in_e:.2f} 混沌)"
     )
 
-    # 4. 对每个通货重新分级
-    new_assignment = {}
-    table = []
-    for name, old_rec in original.items():
-        item = prices.get(name)
-        if item is None:
-            # API 查不到：保留原分级
-            new_assignment[name] = {
-                "base": old_rec["base"],
-                "promotions": list(old_rec["promotions"]),
-            }
-            table.append((name, old_rec["base"], old_rec["base"], None, "查不到，保留"))
+    # 4. 解析所有段（收集全局 tier 展示样式 + 各段分组）
+    parsed = []  # (title, start, end, groups)
+    global_tier_display = {}
+    for title, start, end in sections:
+        groups, tier_display = parse_section(lines[start + 1 : end])
+        if not groups:
             continue
-
-        # 价值先统一折到 e，再拆成「神圣」「混沌」两个量纲：
-        # 分级标准（阈值）保持原生单位，不把 D 档换算成 C 再比。
-        ve = value_in_e(item, divine_in_e, price_fields)
-        if ve is None:
-            new_assignment[name] = {
-                "base": old_rec["base"],
-                "promotions": list(old_rec["promotions"]),
-            }
-            table.append((name, old_rec["base"], old_rec["base"], None, "无价格，保留"))
+        # 跳过完全查不到的段（0% 覆盖，如 Uncut Gems/Tablets/Vault Keys 等），保持原样
+        has_match = any(bt in prices for grp in groups for bt in grp["currencies"])
+        if not has_match:
             continue
+        for tier, meta in tier_display.items():
+            global_tier_display.setdefault(tier, meta)
+        parsed.append((title, start, end, groups))
 
-        value_divine = ve / divine_in_e
-        value_chaos = ve / chaos_in_e
-        base, promotions = compute_assignment(value_divine, value_chaos, args.level)
-        new_assignment[name] = {"base": base, "promotions": promotions}
+    # 5. 对每个通货重新分级（全局价格查询）
+    new_assignments = {}  # {currency_name: {"base", "promotions"}}
+    total_items = 0
+    total_changed = 0
+    section_summary = []  # (title, n_items, n_changed)
+    detail_rows = []  # (section, name, old, new, value_chaos, proms)
 
-        old_tier = old_rec["base"]
-        proms_str = ", ".join(f"{n}+→{t}" for n, t in promotions) or "-"
-        table.append((name, old_tier, base, round(value_chaos, 3), proms_str))
+    for title, start, end, groups in parsed:
+        n_items = 0
+        n_changed = 0
+        for grp in groups:
+            stackable = grp["class"] == "Stackable Currency"
+            for bt, old_rec in grp["currencies"].items():
+                n_items += 1
+                item = prices.get(bt)
+                if item is None:
+                    # API 查不到：保留原分级
+                    new_assignments[bt] = {
+                        "base": old_rec["base"],
+                        "promotions": list(old_rec["promotions"]),
+                    }
+                    detail_rows.append((title, bt, old_rec["base"], old_rec["base"], None, "查不到，保留"))
+                    continue
 
-    # 5. 打印变更对照表
-    print("\n=== 重新分级结果（旧 tier → 新 tier）===")
-    print(f"{'通货':<32}{'旧':<5}{'新':<5}{'价值(混沌)':<12}堆叠升档")
-    for name, old_tier, new_tier, vc, proms in table:
-        mark = "" if old_tier == new_tier else " *"
-        vc_s = str(vc) if vc is not None else "-"
-        print(f"{name:<32}{old_tier or '-':<5}{new_tier:<5}{vc_s:<12}{proms}{mark}")
+                ve = value_in_e(item, divine_in_e, price_fields)
+                if ve is None:
+                    new_assignments[bt] = {
+                        "base": old_rec["base"],
+                        "promotions": list(old_rec["promotions"]),
+                    }
+                    detail_rows.append((title, bt, old_rec["base"], old_rec["base"], None, "无价格，保留"))
+                    continue
 
-    # 6. 重新生成段并写回
-    new_section = regenerate_section(class_line, tier_display, new_assignment)
-    new_lines = (
-        lines[: start + 1]            # 含 "### Currency" 标题行
-        + new_section
-        + lines[end:]                 # 后续段（含下一段的分隔线）
-    )
+                value_divine = ve / divine_in_e
+                value_chaos = ve / chaos_in_e
+                base, promotions = compute_assignment(
+                    value_divine, value_chaos, args.level, stackable=stackable
+                )
+                new_assignments[bt] = {"base": base, "promotions": promotions}
+
+                if base != old_rec["base"]:
+                    n_changed += 1
+                proms_str = ", ".join(f"{n}+→{t}" for n, t in promotions) or "-"
+                detail_rows.append(
+                    (title, bt, old_rec["base"], base, round(value_chaos, 3), proms_str)
+                )
+
+        total_items += n_items
+        total_changed += n_changed
+        section_summary.append((title, n_items, n_changed))
+
+    # 6. 打印汇总
+    print("\n=== 各段重新分级汇总（旧 tier → 新 tier）===")
+    print(f"{'段':<24}{'物品数':>6}{'变动数':>8}")
+    for title, n_items, n_changed in section_summary:
+        print(f"{title:<24}{n_items:>6}{n_changed:>8}")
+
+    if args.verbose:
+        print("\n=== 详细对照表 ===")
+        print(f"{'段':<22}{'通货':<34}{'旧':<5}{'新':<5}{'价值(混沌)':<12}堆叠升档")
+        for title, name, old_tier, new_tier, vc, proms in detail_rows:
+            mark = "" if old_tier == new_tier else " *"
+            vc_s = str(vc) if vc is not None else "-"
+            print(f"{title:<22}{name:<34}{old_tier or '-':<5}{new_tier:<5}{vc_s:<12}{proms}{mark}")
+
+    print(f"\n[统计] 共 {total_items} 个通货类物品，其中 {total_changed} 个 tier 发生变化，"
+          f"{total_items - total_changed} 个不变")
+
+    # 7. 重新生成并写回
+    new_lines = []
+    cursor = 0
+    for title, start, end, groups in parsed:
+        # 保留到段标题之前（含标题上方的分隔线）
+        new_lines.extend(lines[cursor:start])
+        new_lines.append(f"### {title}")
+        new_lines.append("#######################################################")
+        new_lines.append("")
+        new_section = regenerate_section(groups, global_tier_display, new_assignments)
+        new_lines.extend(new_section)
+        cursor = end - 1  # 下一段的开头分隔线留给下一轮
+    new_lines.extend(lines[cursor:])
+
     output_path.write_text("\n".join(new_lines), encoding="utf-8")
-
-    changed = sum(1 for _, o, n, *_ in table if o != n)
     print(f"\n[完成] 输出：{output_path}")
-    print(f"[统计] 共 {len(table)} 个通货，其中 {changed} 个 tier 发生变化，"
-          f"{len(table) - changed} 个不变")
 
 
 if __name__ == "__main__":
