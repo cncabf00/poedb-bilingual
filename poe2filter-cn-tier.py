@@ -26,7 +26,7 @@ poe2filter-cn-tier.py — POE2 过滤器国服通货重分级工具
 参数（均可选）：
     --filter PATH   过滤器路径。默认：<用户目录>/Documents/My Games/Path of Exile 2/poe2filter.filter
     --output PATH   输出路径。默认：同名文件 + "-cn" 后缀（如 poe2filter-cn.filter）
-    --level STR     分级档位：very strict / strict / normal / early-game（默认 very strict）。
+    --level STR     分级档位：very strict / strict / normal / early-game / all（默认 all，一次性导出全部）。
     --token ***     poecurrency.top 的 API Token（可选，优先于 config 文件）。
     --price-field   取值字段，默认 buy_avg（可选 buy_avg / sell_avg / latest_buy1 / latest_sell1）。
     --verbose       打印每件物品的详细对照表（默认只打印每段汇总）。
@@ -606,7 +606,7 @@ def main(argv=None):
     )
     parser.add_argument("--filter", default=str(DEFAULT_FILTER), help="过滤器路径")
     parser.add_argument("--output", default=None, help="输出路径（默认同名 + -cn-{level} 后缀）")
-    parser.add_argument("--level", default="very strict", help="分级档位（very strict / strict / normal / early-game / all）")
+    parser.add_argument("--level", default="all", help="分级档位（very strict / strict / normal / early-game / all，默认 all）")
     parser.add_argument("--token", default=None, help="poecurrency.top API Token（可选，优先于 config 文件）")
     parser.add_argument(
         "--price-field",
