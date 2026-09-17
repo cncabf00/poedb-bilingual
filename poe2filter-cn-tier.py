@@ -219,19 +219,23 @@ def _wpad(s, width):
 
 
 def _fmt_num(x):
-    """数字格式化（去多余小数，大数千分位）。"""
+    """数字格式化（去尾零，大数千分位）。"""
     if x is None:
         return "-"
     ax = abs(x)
     if ax >= 1000:
-        return f"{x:,.0f}"
-    if ax >= 100:
-        return f"{x:.1f}"
-    if ax >= 1:
-        return f"{x:.2f}"
-    if ax >= 0.01:
-        return f"{x:.3f}"
-    return f"{x:.5f}".rstrip("0").rstrip(".") or "0"
+        s = f"{x:,.0f}"
+    elif ax >= 100:
+        s = f"{x:.1f}"
+    elif ax >= 1:
+        s = f"{x:.2f}"
+    elif ax >= 0.01:
+        s = f"{x:.3f}"
+    else:
+        s = f"{x:.6f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s or "0"
 
 
 def compute_unit_factors(cn_prices, game, anchors, price_fields):
@@ -242,21 +246,23 @@ def compute_unit_factors(cn_prices, game, anchors, price_fields):
 
 
 def fmt_price(v_c, fac):
-    """国服混沌价 → 带单位字符串（C 主 + 最接近的 D/E）。"""
+    """价格格式化：优先显示最近的一级单位（C/D/E），括号里附 C 值。
+
+    - ≥1D："{x}D({y}C)"
+    - ≤1E："{x}E({y}C)"（不足 1E 时自然是 0.xxxE）
+    - 其余（1E~1D）："{x}C"（单位就是 C，不需括号）
+    """
     if v_c is None:
         return "-"
-    parts = [f"{_fmt_num(v_c)}C"]
-    cand = []
-    d = v_c / fac["divine_in_chaos"]
-    e = v_c / fac["exalted_in_chaos"]
-    if d > 0:
-        cand.append((abs(math.log10(d)), f"{_fmt_num(d)}D"))
-    if e > 0:
-        cand.append((abs(math.log10(e)), f"{_fmt_num(e)}E"))
-    if cand:
-        cand.sort(key=lambda x: x[0])
-        parts.append(f"({cand[0][1]})")
-    return "".join(parts)
+    d = fac["divine_in_chaos"]
+    e = fac["exalted_in_chaos"]
+    c_s = f"{_fmt_num(v_c)}C"
+    tol = 1e-9
+    if d and v_c >= d * (1 - tol):
+        return f"{_fmt_num(v_c / d)}D({c_s})"
+    if e and e > 0 and v_c <= e * (1 + tol):
+        return f"{_fmt_num(v_c / e)}E({c_s})"
+    return c_s
 
 
 def _index_items(data):
