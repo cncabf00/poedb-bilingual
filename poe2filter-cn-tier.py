@@ -1153,6 +1153,8 @@ def main(argv=None):
             rows.append((v if v is not None else -1.0, cn, name, v))
         rows.sort(key=lambda r: r[0], reverse=True)
         for _p, cn, name, v in rows:
+            if v is None:
+                continue
             print("  " + _wpad(cn, 14) + _wpad(name, 32) + fmt_price(v, fac))
 
 
