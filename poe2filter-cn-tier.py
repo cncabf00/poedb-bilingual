@@ -99,6 +99,12 @@ ANCHOR_NAMES = {CHAOS_NAME, DIVINE_NAME, EXALTED_NAME, PERFECT_EXALTED_NAME}
 ANCHOR_DISCOUNT = 0.7   # 档位下限 = 标志通货价 × 0.7（下浮 30%）
 TIER_STEP = 3.0          # 无标志通货的档位：相邻档 ×3 / ÷3
 
+# 价格可信度：接口必须买、卖两侧都有挂单（latest_buy1 与 latest_sell1 都 > 0）。
+# 只有单边挂单时（典型：本赛季已不存在的道具，只剩上赛季残留买盘），
+# 那个均价是「虚空报价」，不代表市场价 —— 用它重分级会把道具误降/误升。
+# 这类道具一律保留原档、不参与重分级（标志通货不受此限，它们本就钉在原档）。
+REQUIRE_BOTH_SIDES = True
+
 # 末尾附「兑换比例」的名称（C/D/E 全变种 + 点金/机会/瓦尔 + 蜕变/增幅 + 发辫 + 镜子）
 BENCHMARK_NAMES = [
     "Chaos Orb", "Greater Chaos Orb", "Perfect Chaos Orb",
@@ -386,6 +392,18 @@ def cn_value_in_chaos(game, item, anchors, price_fields):
 
 
 # ============================== 分级（锚定标志通货 + 估算） ==============================
+
+def price_is_reliable(item):
+    """价格是否可信：买卖两侧挂单都有（latest_buy1 > 0 且 latest_sell1 > 0）。
+
+    只有单边挂单时（典型：本赛季已不存在、只剩上赛季残留买盘的道具），
+    接口给的均价是「虚空报价」，不能拿来重分级。item 为 None 时交给
+    cn_value_in_chaos 的既有逻辑处理（查不到价 → 保留原档）。
+    """
+    if not REQUIRE_BOTH_SIDES or item is None:
+        return True
+    return bool(item.get("latest_buy1")) and bool(item.get("latest_sell1"))
+
 
 def compute_floors(cn_prices, anchor_tiers, game, anchors, price_fields):
     """按标志通货推算各档价格下限（全局）。返回 {tier: 下限(国服混沌价)}。
@@ -789,12 +807,14 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
 
     只删除「黑名单」（配置里 REMOVE_ITEMS）列出的道具（国服确实没有的，防加载失败）；
     其余（含国服查不到价的道具）都保留原档。
+    价格不可信（挂单只有单边，见 price_is_reliable）的道具同样保留原档。
     """
     new_assignments = {}
     total_items = 0
     total_changed = 0
     total_removed = 0
     removed_rows = []
+    unreliable_rows = []
     section_summary = []
     detail_rows = []
     remove_norm = {normalize_name(n) for n in remove_items}
@@ -831,9 +851,14 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
                 n_items += 1
                 item = cn_prices.get(normalize_name(bt))
                 cn_value = cn_value_in_chaos(game, item, anchors, price_fields)
-                base, promotions = assign_currency(
-                    bt, cn_value, old_rec["base"], floors, stackable
-                )
+                if bt not in ANCHOR_NAMES and not price_is_reliable(item):
+                    # 价格不可信（挂单只有单边）：保留原档，也不做堆叠升档
+                    base, promotions = old_rec["base"], []
+                    unreliable_rows.append((title, bt, old_rec["base"], cn_value, item))
+                else:
+                    base, promotions = assign_currency(
+                        bt, cn_value, old_rec["base"], floors, stackable
+                    )
                 new_assignments[bt] = {"base": base, "promotions": promotions}
 
                 if base != old_rec["base"]:
@@ -858,6 +883,19 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
         print(f"\n[删除] 移除 {total_removed} 个黑名单道具（防加载失败）:")
         for title, bt, old_tier in removed_rows:
             print(f"  - {cn_of(bt)} {bt}（原 {old_tier} 档，段「{title}」）")
+
+    # 打印价格不可信（挂单只有单边）的跳过信息
+    if unreliable_rows:
+        print(f"\n[价格不可信] {len(unreliable_rows)} 个道具挂单只有单边，保留原档不重分级:")
+        print(_wpad("段", 18) + _wpad("中文", 18) + _wpad("英文", 40) + _wpad("原档", 4)
+              + _wpad("接口均价", 16) + "买1 / 卖1")
+        for title, bt, old_tier, value, item in sorted(
+                unreliable_rows, key=lambda r: -(r[3] or 0)):
+            it = item or {}
+            vc = fmt_price(value, fac) if value is not None else "-"
+            print(_wpad(title, 18) + _wpad(cn_of(bt), 18) + _wpad(bt, 40)
+                  + _wpad(old_tier or "-", 4) + _wpad(vc, 16)
+                  + f"{_fmt_num(it.get('latest_buy1'))} / {_fmt_num(it.get('latest_sell1'))}")
 
     # 段顺序（按过滤器出现顺序）
     sec_order = {}
@@ -895,7 +933,8 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
 
     print(
         f"[统计] 共 {total_items} 个通货类物品，其中 {total_changed} 个 tier 发生变化，"
-        f"{total_items - total_changed} 个不变，删除 {total_removed} 个黑名单道具"
+        f"{total_items - total_changed} 个不变，删除 {total_removed} 个黑名单道具，"
+        f"{len(unreliable_rows)} 个因价格不可信（单边挂单）保留原档"
     )
 
     return new_assignments, total_items, total_changed
