@@ -92,8 +92,11 @@ CHAOS_NAME = "Chaos Orb"    # C = 混沌石
 DIVINE_NAME = "Divine Orb"  # D = 神圣石
 EXALTED_NAME = "Exalted Orb"  # e 计价基准（崇高石）
 
-# 锚定通货（相对判定里，这三个标志通货钉在原档位，不随汇率浮动）
-ANCHOR_NAMES = {CHAOS_NAME, DIVINE_NAME, EXALTED_NAME}
+# 标志通货（锚定，钉在原档位，且用于推算各档价格下限）
+PERFECT_EXALTED_NAME = "Perfect Exalted Orb"
+ANCHOR_NAMES = {CHAOS_NAME, DIVINE_NAME, EXALTED_NAME, PERFECT_EXALTED_NAME}
+ANCHOR_DISCOUNT = 0.7   # 档位下限 = 标志通货价 × 0.7（下浮 30%）
+TIER_STEP = 3.0          # 无标志通货的档位：相邻档 ×3 / ÷3
 
 # 要处理的区域：从 "Tiered Currency Rules" 之后，到 "Bottom Free-text Rules" 之前。
 # 之前的 Uniques/Gear/Jewellery 等装备段、以及 "Currency Rules"（Gold 规则）都不处理。
@@ -193,6 +196,17 @@ def normalize_name(name):
     if not name:
         return ""
     return name.replace("'", "").replace("\u2019", "").lower()
+
+
+def _dispw(s):
+    """字符串显示宽度（CJK 算 2 列）。"""
+    return sum(2 if ord(c) > 0x2E7F else 1 for c in s)
+
+
+def _wpad(s, width):
+    """按显示宽度左对齐补空格（中文对齐用）。"""
+    s = str(s)
+    return s + " " * max(0, width - _dispw(s))
 
 
 def _index_items(data):
@@ -310,63 +324,85 @@ def cn_value_in_chaos(game, item, anchors, price_fields):
     return None
 
 
-# ============================== 分级（相对判定） ==============================
+# ============================== 分级（锚定标志通货 + 估算） ==============================
 
-def compute_boundaries(section_items, intl_prices):
-    """根据国际服价计算相邻档位的分界点。
+def compute_floors(cn_prices, anchor_tiers, game, anchors, price_fields):
+    """按标志通货推算各档价格下限（全局）。返回 {tier: 下限(国服混沌价)}。
 
-    section_items: {name: original_tier}（某个段/组里的通货及其原档位）
-    intl_prices:   {name: 国际服混沌价}
-    返回 [(boundary_value, higher_tier, lower_tier)]，按 value 从高到低。
-
-    规则：每档上下限 = 档内最贵/最便宜道具的国际服价（最高档无上限、最低档无下限）；
-    相邻两档分界点 = (上一档下界 + 下一档上界) / 2。
+    anchor_tiers: {标志通货名: 原档位}（从过滤器里取）
+    规则：
+      1) 有标志通货的档位：下限 = 标志通货国服价 × ANCHOR_DISCOUNT（下浮 30%）
+      2) 无标志通货的档位：在相邻两个有锚档位之间做几何插值（等价于 ×3/÷3 阶梯）
     """
-    tier_vals = {}
-    for name, tier in section_items.items():
-        v = intl_prices.get(name)
-        if v is None or tier not in TIER_RANK:
+    tier_price = {}
+    for name, tier in anchor_tiers.items():
+        item = cn_prices.get(normalize_name(name))
+        if item is None or tier is None:
             continue
-        tier_vals.setdefault(tier, []).append(v)
+        p = cn_value_in_chaos(game, item, anchors, price_fields)
+        if p:
+            # 同一档多个标志通货时取最低价（作为该档下限基准）
+            tier_price[tier] = min(tier_price.get(tier, p), p)
 
-    tier_bounds = {t: (min(vs), max(vs)) for t, vs in tier_vals.items()}
+    floors = {t: p * ANCHOR_DISCOUNT for t, p in tier_price.items()}
+    anchored = sorted(floors, key=lambda t: TIER_RANK[t])  # 高→低
 
-    boundaries = []
-    for i in range(len(TIER_ORDER) - 1):
-        high, low = TIER_ORDER[i], TIER_ORDER[i + 1]
-        if high not in tier_bounds or low not in tier_bounds:
-            continue  # 空档跳过
-        b = (tier_bounds[high][0] + tier_bounds[low][1]) / 2
-        boundaries.append((b, high, low))
-    return boundaries
+    # 相邻两个有锚档位之间几何插值填充
+    for i in range(len(anchored) - 1):
+        hi, lo = anchored[i], anchored[i + 1]
+        gap = TIER_RANK[lo] - TIER_RANK[hi] - 1
+        if gap <= 0:
+            continue
+        ratio = (floors[lo] / floors[hi]) ** (1.0 / (gap + 1))
+        for j in range(1, gap + 1):
+            t = TIER_ORDER[TIER_RANK[hi] + j]
+            floors[t] = floors[hi] * (ratio ** j)
+
+    # 向两端延伸（÷3 更低档 / ×3 更高档）
+    if anchored:
+        lo_tier = anchored[-1]
+        f = floors[lo_tier]
+        for t in TIER_ORDER[TIER_RANK[lo_tier] + 1:]:
+            f = f / TIER_STEP
+            floors[t] = f
+        hi_tier = anchored[0]
+        f = floors[hi_tier]
+        for t in reversed(TIER_ORDER[:TIER_RANK[hi_tier]]):
+            f = f * TIER_STEP
+            floors[t] = f
+
+    return floors
 
 
-def relative_tier(value, boundaries):
-    """按分界点判定档位。value 是国服混沌价。"""
-    for b, high, _low in boundaries:  # 从高到低
-        if value >= b:
-            return high
-    return boundaries[-1][2] if boundaries else None
+def tier_of_value(value, floors):
+    """按国服价落档：取「下限 <= value」的最高档。"""
+    for t in TIER_ORDER:  # 从高到低
+        f = floors.get(t)
+        if f is not None and value >= f:
+            return t
+    for t in reversed(TIER_ORDER):  # 低于所有下限 → 最低的有锚档
+        if t in floors:
+            return t
+    return None
 
 
-def assign_currency(name, cn_value, original_tier, boundaries, stackable):
+def assign_currency(name, cn_value, original_tier, floors, stackable):
     """判定单个通货的新档位 + 堆叠升档。
 
-    锚定规则：C/D/E 三个标志通货钉在原档位；查不到的保留原档。
-    堆叠升档：仅 stackable 通货，按 N×国服价 看是否跨入更高档。
+    规则4（不动 > 上调 > 下调）：按国服价落到对应档；国服价仍在原档区间就保留原档，
+    高于原档区间则上调，低于则下调（自然实现）。标志通货钉在原档；查不到价的保留原档。
     """
-    if name in ANCHOR_NAMES or cn_value is None:
+    if name in ANCHOR_NAMES or cn_value is None or not floors:
         base = original_tier
     else:
-        base = relative_tier(cn_value, boundaries)
-        if base is None:
-            base = original_tier
+        t = tier_of_value(cn_value, floors)
+        base = t if t is not None else original_tier
 
     promotions = []
-    if stackable and cn_value is not None:
+    if stackable and cn_value is not None and floors:
         prev = base
         for n in sorted(STACK_CHECKPOINTS):  # 3,5,10,20 升序
-            t = relative_tier(n * cn_value, boundaries)
+            t = tier_of_value(n * cn_value, floors)
             if t is None:
                 continue
             if TIER_RANK[t] < TIER_RANK[prev]:  # t 比 prev 更高档
@@ -688,7 +724,7 @@ def make_output_path(filter_path, explicit_output):
 
 
 def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_items, verbose):
-    """相对判定重新分级（共享逻辑），返回 (new_assignments, total_items, total_changed)。
+    """重新分级（锚定标志通货法），返回 (new_assignments, total_items, total_changed)。
 
     只删除「黑名单」（配置里 REMOVE_ITEMS）列出的道具（国服确实没有的，防加载失败）；
     其余（含国服查不到价的道具）都保留原档。
@@ -701,6 +737,17 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
     section_summary = []
     detail_rows = []
     remove_norm = {normalize_name(n) for n in remove_items}
+
+    # 标志通货的档位（取 base 块），据此算全局各档价格下限
+    anchor_tiers = {}
+    for _t, _s, _e, _groups in parsed:
+        for grp in _groups:
+            for bt, rec in grp["currencies"].items():
+                if bt in ANCHOR_NAMES and rec["base"] and bt not in anchor_tiers:
+                    anchor_tiers[bt] = rec["base"]
+    floors = compute_floors(cn_prices, anchor_tiers, game, anchors, price_fields)
+    if verbose and floors:
+        print("[档位下限] " + ", ".join(f"{t}={floors[t]:.3f}" for t in TIER_ORDER if t in floors))
 
     for title, start, end, groups in parsed:
         n_items = 0
@@ -716,16 +763,14 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
             if not grp["currencies"]:
                 continue  # 整组删光，跳过
 
-            # 2) 相对判定重新分级
+            # 2) 按标志通货下限重新分级
             stackable = grp["class"] == "Stackable Currency"
-            section_items = {bt: rec["base"] for bt, rec in grp["currencies"].items()}
-            boundaries = compute_boundaries(section_items, intl_prices)
             for bt, old_rec in grp["currencies"].items():
                 n_items += 1
                 item = cn_prices.get(normalize_name(bt))
                 cn_value = cn_value_in_chaos(game, item, anchors, price_fields)
                 base, promotions = assign_currency(
-                    bt, cn_value, old_rec["base"], boundaries, stackable
+                    bt, cn_value, old_rec["base"], floors, stackable
                 )
                 new_assignments[bt] = {"base": base, "promotions": promotions}
 
@@ -739,19 +784,26 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
         total_changed += n_changed
         section_summary.append((title, n_items, n_changed))
 
+    # 中文名查询（从国服数据取 item_name）
+    def cn_of(en_name):
+        it = cn_prices.get(normalize_name(en_name))
+        cn = (it.get("item_name") or "") if it else ""
+        return cn or "-"
+
     # 打印删除信息
     if removed_rows:
         print(f"\n[删除] 移除 {total_removed} 个黑名单道具（防加载失败）:")
         for title, bt, old_tier in removed_rows:
-            print(f"  - {bt}（原 {old_tier} 档，段「{title}」）")
+            print(f"  - {cn_of(bt)} {bt}（原 {old_tier} 档，段「{title}」）")
 
     # 变更明细（默认输出：只列 tier 发生变化的道具）
     changed_rows = [r for r in detail_rows if r[2] != r[3]]
     if changed_rows:
         print(f"\n=== 变更明细（{len(changed_rows)} 个 tier 变化） ===")
-        print(f"{'段':<24}{'通货':<32}{'旧档':>4} → {'新档':<4}")
+        print(_wpad("段", 18) + _wpad("中文", 18) + _wpad("英文", 34) + "旧 → 新")
         for title, name, old_tier, new_tier, vc, proms in changed_rows:
-            print(f"{title:<24}{name:<32}{old_tier or '-':>4} → {new_tier:<4}")
+            print(_wpad(title, 18) + _wpad(cn_of(name), 18) + _wpad(name, 34)
+                  + f"{old_tier or '-'} → {new_tier}")
     else:
         print("\n[变更明细] 无 tier 变化")
 
@@ -763,11 +815,14 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
 
     if verbose:
         print("\n=== 详细对照表 ===")
-        print(f"{'段':<22}{'通货':<34}{'旧':<5}{'新':<5}{'价值(混沌)':<12}堆叠升档")
+        print(_wpad("段", 18) + _wpad("中文", 18) + _wpad("英文", 32)
+              + _wpad("旧", 4) + _wpad("新", 4) + _wpad("价值(混沌)", 12) + "堆叠升档")
         for title, name, old_tier, new_tier, vc, proms in detail_rows:
             mark = "" if old_tier == new_tier else " *"
             vc_s = str(vc) if vc is not None else "-"
-            print(f"{title:<22}{name:<34}{old_tier or '-':<5}{new_tier:<5}{vc_s:<12}{proms}{mark}")
+            print(_wpad(title, 18) + _wpad(cn_of(name), 18) + _wpad(name, 32)
+                  + _wpad(old_tier or "-", 4) + _wpad(new_tier, 4) + _wpad(vc_s, 12)
+                  + proms + mark)
 
     print(
         f"[统计] 共 {total_items} 个通货类物品，其中 {total_changed} 个 tier 发生变化，"
