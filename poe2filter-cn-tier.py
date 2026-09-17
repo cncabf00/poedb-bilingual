@@ -14,7 +14,7 @@ poe2filter-cn-tier.py — POE 过滤器国服通货重分级工具（支持 POE1
   5. 国服查不到的道具删除（国际服比国服多出的物品）；白名单（KEEP_WHITELIST）里的基础通货保留原档
 
 用法示例：
-    # 默认：同时处理 POE1 + POE2 默认目录（自动扫 .filter，排除 -cn，自动识别格式）
+    # 默认：同时处理 POE1 + POE2 默认目录（自动扫 .filter，排除 [CN]，自动识别格式）
     python3 poe2filter-cn-tier.py
 
     # 只处理某一代
@@ -36,7 +36,7 @@ poe2filter-cn-tier.py — POE 过滤器国服通货重分级工具（支持 POE1
     --poe1-dir PATH POE1 过滤器目录（默认 Documents/My Games/Path of Exile）
     --poe2-dir PATH POE2 过滤器目录（默认 Documents/My Games/Path of Exile 2）
     --filter PATH   单个过滤器文件（可选，指定后只处理这一个）
-    --output PATH   单文件模式的输出路径（默认同名 + -cn 后缀）
+    --output PATH   单文件模式的输出路径（默认加 [CN] 前缀）
     --format STR    过滤器格式：auto（默认自动识别）/ poe2filter / filterblade
     --token ***     poecurrency.top 的 API Token（可选，优先于 config 文件）
     --price-field   取值字段，默认 buy_avg
@@ -712,11 +712,11 @@ def regenerate_filterblade(lines, groups, tier_meta, blocks, new_assignments):
 # ============================== 主流程 ==============================
 
 def make_output_path(filter_path, explicit_output):
-    """生成输出路径。默认同名 + -cn 后缀。"""
+    """生成输出路径。默认加 [CN] 前缀。"""
     if explicit_output:
         return Path(explicit_output).expanduser()
     p = Path(filter_path).expanduser()
-    return p.with_name(p.stem + "-cn" + p.suffix)
+    return p.with_name("[CN]" + p.name)
 
 
 def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, verbose):
@@ -837,12 +837,12 @@ def detect_format_file(path, fmt_override):
 
 
 def scan_filters(directory):
-    """扫描目录下所有 .filter 文件（排除 -cn 后缀的，即自己生成的）。"""
+    """扫描目录下所有 .filter 文件（排除 [CN] 前缀的，即自己生成的）。"""
     if not directory.is_dir():
         return []
     files = []
     for p in sorted(directory.glob("*.filter")):
-        if p.stem.endswith("-cn"):
+        if p.name.startswith("[CN]"):
             continue
         files.append(p)
     return files
