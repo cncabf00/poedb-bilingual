@@ -827,6 +827,20 @@ def scan_filters(directory):
     return files
 
 
+def collect_base_names(files):
+    """从过滤器文件里提取所有 BaseType 英文名（用于国际服价 slug/baseType 匹配）。"""
+    names = set()
+    for fp in files:
+        try:
+            text = fp.read_text(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            continue
+        for line in text.splitlines():
+            if "BaseType ==" in line:
+                names.update(re.findall(r'"([^"]+)"', line))
+    return names
+
+
 def process_one(filter_path, game, args, cn_prices, intl_prices, anchors, price_fields, remove_items):
     """处理单个过滤器文件（识别格式 → 解析 → 重分级 → 生成 → 写回）。"""
     print(f"\n--- 处理: {filter_path.name} ---")
@@ -978,7 +992,8 @@ def main(argv=None):
         if need_fetch:
             try:
                 league = poe_ninja.get_current_league(game)
-                intl_latest = poe_ninja.fetch_international_prices(game, league)
+                all_names = collect_base_names([f for fs in groups.values() for f in fs])
+                intl_latest = poe_ninja.fetch_international_prices(game, name_set=all_names)
                 print(f"[国际服] 拉到最新 {len(intl_latest)} 个通货价格")
             except Exception as e:  # noqa: BLE001
                 print(f"[WARN] 拉取国际服价失败（{e}），需更新的格式组将回退用快照")

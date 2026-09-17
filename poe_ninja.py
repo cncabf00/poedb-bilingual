@@ -24,6 +24,7 @@ poe_ninja.py — 国际服物价抓取模块（支持 POE1 / POE2）
 """
 
 import json
+import re
 import urllib.parse
 import urllib.request
 
@@ -35,6 +36,10 @@ INDEX_STATE_URLS = {
 ECONOMY_URLS = {
     "poe1": "https://poe.ninja/poe1/api/economy/exchange/current/overview",
     "poe2": "https://poe.ninja/poe2/api/economy/exchange/current/overview",
+}
+STASH_URLS = {
+    "poe1": "https://poe.ninja/poe1/api/economy/stash/current/item/overview",
+    "poe2": "https://poe.ninja/poe2/api/economy/stash/current/item/overview",
 }
 
 # 分类 type 值（用于抓取国际服价）
@@ -182,6 +187,45 @@ def slug_to_name(game, slug):
     return SLUG_TO_NAME.get(slug)
 
 
+# ============================== 分类配置 ==============================
+
+# exchange 端点（/api/economy/exchange/current/overview）的通货类分类 type（按 game）
+# POE2 有 14 个通货类分类；POE1 只需 Currency（已含催化剂/生命之力等）
+EXCHANGE_TYPES = {
+    "poe2": [
+        "Currency", "Fragments", "Abyss", "UncutGems", "LineageSupportGems",
+        "Essences", "SoulCores", "Idols", "Runes", "Ritual", "Expedition",
+        "Delirium", "Breach", "Verisium",
+    ],
+    "poe1": ["Currency"],
+}
+
+# stash 端点（/api/economy/stash/current/item/overview）的分类 type（按 game）
+# 用 baseType 字段直接匹配英文名（无需 slug）
+STASH_TYPES = {
+    "poe2": ["PrecursorTablets"],
+    "poe1": [],
+}
+
+
+def slugify(name):
+    """英文名 → poe.ninja 的 id slug。
+
+    去撇号、空格转横线、去括号/冒号/逗号、小写；
+    "(Level N)" → "N"（如 Uncut Skill Gem (Level 1) → uncut-skill-gem-1）。
+    """
+    s = re.sub(r"\(level\s*(\d+)\)", r"\1", name, flags=re.IGNORECASE)
+    return (
+        s.replace("'", "")
+        .replace(" ", "-")
+        .replace("(", "")
+        .replace(")", "")
+        .replace(":", "")
+        .replace(",", "")
+        .lower()
+    )
+
+
 # ============================== 抓取 ==============================
 
 def http_get_json(url, timeout=30):
@@ -210,9 +254,16 @@ def get_current_league(game, index_state=None):
 
 
 def fetch_overview(game, league, type_value):
-    """返回某 game 某赛季某分类的 overview JSON。"""
+    """返回某 game 某赛季某分类的 exchange overview JSON。"""
     league_q = urllib.parse.quote_plus(league)
     url = f"{ECONOMY_URLS[game]}?league={league_q}&type={type_value}"
+    return http_get_json(url)
+
+
+def fetch_stash_overview(game, league, type_value):
+    """返回某 game 某赛季某分类的 stash overview JSON（如 PrecursorTablets）。"""
+    league_q = urllib.parse.quote_plus(league)
+    url = f"{STASH_URLS[game]}?league={league_q}&type={type_value}"
     return http_get_json(url)
 
 
@@ -245,23 +296,84 @@ def fetch_prices_by_type(game, league, type_value):
     return prices
 
 
-def fetch_international_prices(game, league=None):
-    """抓取某 game 全部通货类国际服价（Currency 类型为主），返回 {英文名: 混沌价值}。
+def _match_slug(game, slug, slug_map):
+    """把 slug 匹配到英文名。
 
-    目前只抓 Currency（主通货）。其它分类（Delirium/Breach/Essences/Ritual 等）
-    后续按需扩展 slug 映射后追加。
+    先试 slug_map（过滤器英文名的 slugify，覆盖长 slug）；
+    再回退内置映射（覆盖 Currency 的短 slug，如 chaos/divine/alch）。
     """
-    if league is None:
-        league = get_current_league(game)
-    return fetch_prices_by_type(game, league, TYPE_CURRENCY)
+    if not slug:
+        return None
+    if slug_map is not None and slug in slug_map:
+        return slug_map[slug]
+    return slug_to_name(game, slug)
+
+
+def fetch_international_prices(game, name_set=None):
+    """抓取某 game 全部通货类国际服价，返回 {英文名: 混沌价值}。
+
+    name_set: 过滤器里的英文名集合（用于 slug / baseType 匹配）。
+              None 时用内置 SLUG_TO_NAME（仅 Currency）。
+    """
+    league = get_current_league(game)
+    slug_map = {slugify(n): n for n in name_set} if name_set is not None else None
+    result = {}
+
+    # exchange 端点（用 slug 匹配）
+    for type_value in EXCHANGE_TYPES.get(game, []):
+        try:
+            data = fetch_overview(game, league, type_value)
+        except Exception:  # noqa: BLE001
+            continue
+        lines = data.get("lines", [])
+        if game == "poe1":
+            # POE1: primaryValue 直接是混沌价
+            for line in lines:
+                name = _match_slug(game, line.get("id"), slug_map)
+                if name and line.get("primaryValue") is not None:
+                    result[name] = line["primaryValue"]
+            continue
+        # POE2: primaryValue × rates.chaos 折到混沌
+        cpd = data.get("core", {}).get("rates", {}).get("chaos")
+        if not cpd:
+            continue
+        for line in lines:
+            name = _match_slug(game, line.get("id"), slug_map)
+            if name and line.get("primaryValue") is not None:
+                result[name] = line["primaryValue"] * cpd
+
+    # stash 端点（用 baseType 匹配）
+    for type_value in STASH_TYPES.get(game, []):
+        try:
+            data = fetch_stash_overview(game, league, type_value)
+        except Exception:  # noqa: BLE001
+            continue
+        cpd = data.get("core", {}).get("rates", {}).get("chaos")
+        if not cpd:
+            continue
+        # 同一 baseType 有多个 variant（Normal/Magic/Rare），取最小 primaryValue
+        seen = {}
+        for line in data.get("lines", []):
+            bt = line.get("baseType")
+            val = line.get("primaryValue")
+            if not bt or val is None:
+                continue
+            if name_set is not None and bt not in name_set:
+                continue
+            if bt not in seen or val < seen[bt]:
+                seen[bt] = val
+        for bt, val in seen.items():
+            result[bt] = val * cpd
+
+    return result
 
 
 if __name__ == "__main__":
     for game in ("poe2", "poe1"):
         league = get_current_league(game)
         print(f"[{game}] 当前赛季: {league}")
-        prices = fetch_international_prices(game, league)
+        prices = fetch_international_prices(game)
         print(f"[{game}] 抓到 {len(prices)} 个通货价格（折到混沌）")
-        for name, val in sorted(prices.items(), key=lambda kv: -kv[1])[:6]:
+        for name, val in sorted(prices.items(), key=lambda kv: -kv[1])[:8]:
             print(f"    {name:<30} {val:.4f}")
         print()
