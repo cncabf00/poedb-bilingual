@@ -859,11 +859,16 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
         for title, bt, old_tier in removed_rows:
             print(f"  - {cn_of(bt)} {bt}（原 {old_tier} 档，段「{title}」）")
 
-    # 变更明细（默认输出：只列 tier 发生变化的道具，按价格降序）
+    # 段顺序（按过滤器出现顺序）
+    sec_order = {}
+    for _r in detail_rows:
+        sec_order.setdefault(_r[0], len(sec_order))
+
+    # 变更明细（默认输出：先按段，同段内按价格降序）
     changed_rows = [r for r in detail_rows if r[2] != r[3]]
-    changed_rows.sort(key=lambda r: r[6], reverse=True)
+    changed_rows.sort(key=lambda r: (sec_order.get(r[0], 9999), -r[6]))
     if changed_rows:
-        print(f"\n=== 变更明细（{len(changed_rows)} 个 tier 变化） ===")
+        print(f"\n=== 变更明细（{len(changed_rows)} 个 tier 变化，按段 + 价格） ===")
         print(_wpad("段", 18) + _wpad("中文", 18) + _wpad("英文", 32) + _wpad("旧 → 新", 10) + "价格")
         for title, name, old_tier, new_tier, vc, proms, _p in changed_rows:
             print(_wpad(title, 18) + _wpad(cn_of(name), 18) + _wpad(name, 32)
@@ -878,10 +883,11 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
         print(f"{title:<24}{n_items:>6}{n_changed:>8}")
 
     if verbose:
-        print("\n=== 详细对照表（按价格降序） ===")
+        print("\n=== 详细对照表（按段 + 价格） ===")
         print(_wpad("段", 18) + _wpad("中文", 18) + _wpad("英文", 30)
               + _wpad("旧", 4) + _wpad("新", 4) + _wpad("价格", 18) + "堆叠升档")
-        for title, name, old_tier, new_tier, vc, proms, _p in sorted(detail_rows, key=lambda r: r[6], reverse=True):
+        for title, name, old_tier, new_tier, vc, proms, _p in sorted(
+                detail_rows, key=lambda r: (sec_order.get(r[0], 9999), -r[6])):
             mark = "" if old_tier == new_tier else " *"
             print(_wpad(title, 18) + _wpad(cn_of(name), 18) + _wpad(name, 30)
                   + _wpad(old_tier or "-", 4) + _wpad(new_tier, 4) + _wpad(vc, 18)
