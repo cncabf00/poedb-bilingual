@@ -49,6 +49,7 @@ poe2filter-cn-tier.py — POE 过滤器国服通货重分级工具（支持 POE1
 import argparse
 import importlib.util
 import json
+import math
 import re
 import sys
 import time
@@ -97,6 +98,14 @@ PERFECT_EXALTED_NAME = "Perfect Exalted Orb"
 ANCHOR_NAMES = {CHAOS_NAME, DIVINE_NAME, EXALTED_NAME, PERFECT_EXALTED_NAME}
 ANCHOR_DISCOUNT = 0.7   # 档位下限 = 标志通货价 × 0.7（下浮 30%）
 TIER_STEP = 3.0          # 无标志通货的档位：相邻档 ×3 / ÷3
+
+# 末尾附「标志通货兑换比例」的名称（C/D/E 全变种 + 发辫 + 镜子）
+BENCHMARK_NAMES = [
+    "Chaos Orb", "Greater Chaos Orb", "Perfect Chaos Orb",
+    "Divine Orb",
+    "Exalted Orb", "Greater Exalted Orb", "Perfect Exalted Orb",
+    "Hinekora's Lock", "Mirror of Kalandra",
+]
 
 # 要处理的区域：从 "Tiered Currency Rules" 之后，到 "Bottom Free-text Rules" 之前。
 # 之前的 Uniques/Gear/Jewellery 等装备段、以及 "Currency Rules"（Gold 规则）都不处理。
@@ -207,6 +216,47 @@ def _wpad(s, width):
     """按显示宽度左对齐补空格（中文对齐用）。"""
     s = str(s)
     return s + " " * max(0, width - _dispw(s))
+
+
+def _fmt_num(x):
+    """数字格式化（去多余小数，大数千分位）。"""
+    if x is None:
+        return "-"
+    ax = abs(x)
+    if ax >= 1000:
+        return f"{x:,.0f}"
+    if ax >= 100:
+        return f"{x:.1f}"
+    if ax >= 1:
+        return f"{x:.2f}"
+    if ax >= 0.01:
+        return f"{x:.3f}"
+    return f"{x:.5f}".rstrip("0").rstrip(".") or "0"
+
+
+def compute_unit_factors(cn_prices, game, anchors, price_fields):
+    """由 C/D/E 锚点算单位换算：1C=?D、1C=?E。"""
+    d = cn_value_in_chaos(game, cn_prices.get(normalize_name(DIVINE_NAME)), anchors, price_fields)
+    e = cn_value_in_chaos(game, cn_prices.get(normalize_name(EXALTED_NAME)), anchors, price_fields)
+    return {"divine_in_chaos": d or 1.0, "exalted_in_chaos": e or 1.0}
+
+
+def fmt_price(v_c, fac):
+    """国服混沌价 → 带单位字符串（C 主 + 最接近的 D/E）。"""
+    if v_c is None:
+        return "-"
+    parts = [f"{_fmt_num(v_c)}C"]
+    cand = []
+    d = v_c / fac["divine_in_chaos"]
+    e = v_c / fac["exalted_in_chaos"]
+    if d > 0:
+        cand.append((abs(math.log10(d)), f"{_fmt_num(d)}D"))
+    if e > 0:
+        cand.append((abs(math.log10(e)), f"{_fmt_num(e)}E"))
+    if cand:
+        cand.sort(key=lambda x: x[0])
+        parts.append(f"({cand[0][1]})")
+    return "".join(parts)
 
 
 def _index_items(data):
@@ -746,8 +796,9 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
                 if bt in ANCHOR_NAMES and rec["base"] and bt not in anchor_tiers:
                     anchor_tiers[bt] = rec["base"]
     floors = compute_floors(cn_prices, anchor_tiers, game, anchors, price_fields)
+    fac = compute_unit_factors(cn_prices, game, anchors, price_fields)
     if verbose and floors:
-        print("[档位下限] " + ", ".join(f"{t}={floors[t]:.3f}" for t in TIER_ORDER if t in floors))
+        print("[档位下限] " + ", ".join(f"{t}={fmt_price(floors[t], fac)}" for t in TIER_ORDER if t in floors))
 
     for title, start, end, groups in parsed:
         n_items = 0
@@ -777,7 +828,7 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
                 if base != old_rec["base"]:
                     n_changed += 1
                 proms_str = ", ".join(f"{n}+→{t}" for n, t in promotions) or "-"
-                vc = round(cn_value, 3) if cn_value is not None else None
+                vc = fmt_price(cn_value, fac)
                 detail_rows.append((title, bt, old_rec["base"], base, vc, proms_str))
 
         total_items += n_items
@@ -800,10 +851,10 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
     changed_rows = [r for r in detail_rows if r[2] != r[3]]
     if changed_rows:
         print(f"\n=== 变更明细（{len(changed_rows)} 个 tier 变化） ===")
-        print(_wpad("段", 18) + _wpad("中文", 18) + _wpad("英文", 34) + "旧 → 新")
+        print(_wpad("段", 18) + _wpad("中文", 18) + _wpad("英文", 32) + _wpad("旧 → 新", 10) + "价格")
         for title, name, old_tier, new_tier, vc, proms in changed_rows:
-            print(_wpad(title, 18) + _wpad(cn_of(name), 18) + _wpad(name, 34)
-                  + f"{old_tier or '-'} → {new_tier}")
+            print(_wpad(title, 18) + _wpad(cn_of(name), 18) + _wpad(name, 32)
+                  + _wpad(f"{old_tier or '-'} → {new_tier}", 10) + vc)
     else:
         print("\n[变更明细] 无 tier 变化")
 
@@ -815,13 +866,12 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
 
     if verbose:
         print("\n=== 详细对照表 ===")
-        print(_wpad("段", 18) + _wpad("中文", 18) + _wpad("英文", 32)
-              + _wpad("旧", 4) + _wpad("新", 4) + _wpad("价值(混沌)", 12) + "堆叠升档")
+        print(_wpad("段", 18) + _wpad("中文", 18) + _wpad("英文", 30)
+              + _wpad("旧", 4) + _wpad("新", 4) + _wpad("价格", 18) + "堆叠升档")
         for title, name, old_tier, new_tier, vc, proms in detail_rows:
             mark = "" if old_tier == new_tier else " *"
-            vc_s = str(vc) if vc is not None else "-"
-            print(_wpad(title, 18) + _wpad(cn_of(name), 18) + _wpad(name, 32)
-                  + _wpad(old_tier or "-", 4) + _wpad(new_tier, 4) + _wpad(vc_s, 12)
+            print(_wpad(title, 18) + _wpad(cn_of(name), 18) + _wpad(name, 30)
+                  + _wpad(old_tier or "-", 4) + _wpad(new_tier, 4) + _wpad(vc, 18)
                   + proms + mark)
 
     print(
@@ -1078,6 +1128,15 @@ def main(argv=None):
                     process_one(fp, game, args, cn_prices, intl_prices, anchors, price_fields, remove_items)
                 except Exception as e:  # noqa: BLE001
                     print(f"  [错误] 处理 {fp.name} 失败：{e}")
+
+        # 8. 标志通货兑换比例（C/D/E 全变种 + 发辫 + 镜子）
+        fac = compute_unit_factors(cn_prices, game, anchors, price_fields)
+        print(f"\n=== 标志通货兑换比例 [{game.upper()}] ===")
+        for name in BENCHMARK_NAMES:
+            it = cn_prices.get(normalize_name(name))
+            v = cn_value_in_chaos(game, it, anchors, price_fields) if it else None
+            cn = (it.get("item_name") or "-") if it else "-"
+            print("  " + _wpad(cn, 14) + _wpad(name, 26) + fmt_price(v, fac))
 
 
 if __name__ == "__main__":
