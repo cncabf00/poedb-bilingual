@@ -99,11 +99,14 @@ ANCHOR_NAMES = {CHAOS_NAME, DIVINE_NAME, EXALTED_NAME, PERFECT_EXALTED_NAME}
 ANCHOR_DISCOUNT = 0.7   # 档位下限 = 标志通货价 × 0.7（下浮 30%）
 TIER_STEP = 3.0          # 无标志通货的档位：相邻档 ×3 / ÷3
 
-# 末尾附「标志通货兑换比例」的名称（C/D/E 全变种 + 发辫 + 镜子）
+# 末尾附「兑换比例」的名称（C/D/E 全变种 + 点金/机会/瓦尔 + 蜕变/增幅 + 发辫 + 镜子）
 BENCHMARK_NAMES = [
     "Chaos Orb", "Greater Chaos Orb", "Perfect Chaos Orb",
     "Divine Orb",
     "Exalted Orb", "Greater Exalted Orb", "Perfect Exalted Orb",
+    "Orb of Alchemy", "Orb of Chance", "Vaal Orb",
+    "Orb of Transmutation", "Greater Orb of Transmutation", "Perfect Orb of Transmutation",
+    "Orb of Augmentation", "Greater Orb of Augmentation", "Perfect Orb of Augmentation",
     "Hinekora's Lock", "Mirror of Kalandra",
 ]
 
@@ -1150,7 +1153,7 @@ def main(argv=None):
             rows.append((v if v is not None else -1.0, cn, name, v))
         rows.sort(key=lambda r: r[0], reverse=True)
         for _p, cn, name, v in rows:
-            print("  " + _wpad(cn, 14) + _wpad(name, 26) + fmt_price(v, fac))
+            print("  " + _wpad(cn, 14) + _wpad(name, 32) + fmt_price(v, fac))
 
 
 if __name__ == "__main__":
