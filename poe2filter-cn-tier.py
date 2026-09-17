@@ -240,14 +240,14 @@ def _index_items(data):
 
 # ============================== 国际服物价备份表 ==============================
 
-def intl_backup_path(game):
-    """国际服物价备份表路径（脚本同目录）。"""
-    return Path(__file__).resolve().parent / f"intl-{game}.json"
+def intl_backup_path(directory, fmt):
+    """国际服物价备份表路径（放在过滤器目录，按格式区分：filterblade / poe2filter）。"""
+    return Path(directory) / f"intl-{fmt}.json"
 
 
-def load_intl_backup(game):
+def load_intl_backup(path):
     """读国际服物价备份表。返回 (prices_dict, mtime_float)；不存在/损坏返回 (None, None)。"""
-    p = intl_backup_path(game)
+    p = Path(path)
     if not p.exists():
         return None, None
     try:
@@ -260,9 +260,9 @@ def load_intl_backup(game):
         return None, None
 
 
-def save_intl_backup(game, league, prices):
+def save_intl_backup(path, league, prices):
     """写国际服物价备份表（记录当时的国际服价快照）。"""
-    p = intl_backup_path(game)
+    p = Path(path)
     data = {
         "league": league,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -824,6 +824,18 @@ def detect_format(lines):
     return None
 
 
+def detect_format_file(path, fmt_override):
+    """识别单个过滤器文件的格式（只读前 300 行）。"""
+    if fmt_override != "auto":
+        return fmt_override
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            head = [f.readline() for _ in range(300)]
+    except Exception:  # noqa: BLE001
+        return None
+    return detect_format(head)
+
+
 def scan_filters(directory):
     """扫描目录下所有 .filter 文件（排除 -cn 后缀的，即自己生成的）。"""
     if not directory.is_dir():
@@ -932,8 +944,9 @@ def main(argv=None):
         print(f"===== 处理 {game.upper()} =====")
         print('=' * 62)
 
-        # 1. 确定文件列表
+        # 1. 确定目录 + 文件列表
         if args.filter:
+            directory = Path(args.filter).expanduser().parent
             filter_files = [Path(args.filter).expanduser()]
         else:
             d = dir_overrides[game]
@@ -946,7 +959,7 @@ def main(argv=None):
         for fp in filter_files:
             print(f"  - {fp.name}")
 
-        # 2. 抓价格（国服 + 国际服，每个 game 抓一次）
+        # 2. 拉国服价（总是最新）
         try:
             cn_prices = fetch_prices(game, token)
             anchors = compute_anchors(game, cn_prices, price_fields)
@@ -955,32 +968,66 @@ def main(argv=None):
             continue
         print(f"[国服] 1 神圣 ≈ {anchors['divine_in_chaos']:.2f} 混沌")
 
-        # 2.5 国际服价：过滤器比备份表新才拉最新（多对一，任意一个新就算）
-        newest_mtime = max(f.stat().st_mtime for f in filter_files)
-        backup_prices, backup_mtime = load_intl_backup(game)
-        if backup_prices is None or newest_mtime > backup_mtime:
+        # 3. 识别格式 + 按格式分组
+        groups = {}  # fmt -> [files]
+        for fp in filter_files:
+            fmt = detect_format_file(fp, args.format)
+            if fmt is None:
+                print(f"[跳过] {fp.name} 无法识别格式，不转换")
+                continue
+            if fmt == "poe2filter" and game == "poe1":
+                print(f"[跳过] {fp.name} POE1 不支持 poe2filter 格式")
+                continue
+            groups.setdefault(fmt, []).append(fp)
+        if not groups:
+            print(f"[提示] {game} 没有可处理的过滤器")
+            continue
+
+        # 4. 判断哪些格式组需要拉最新国际服价（多对一，任意一个新就算）
+        need_fetch = set()
+        for fmt, files in groups.items():
+            backup_path = intl_backup_path(directory, fmt)
+            backup_prices, backup_mtime = load_intl_backup(backup_path)
+            newest = max(f.stat().st_mtime for f in files)
+            if backup_prices is None or newest > backup_mtime:
+                need_fetch.add(fmt)
+
+        # 5. 按需拉一次最新国际服价（同一游戏各格式共用同一个价源）
+        intl_latest = None
+        league = None
+        if need_fetch:
             try:
                 league = poe_ninja.get_current_league(game)
-                intl_prices = poe_ninja.fetch_international_prices(game, league)
-                save_intl_backup(game, league, intl_prices)
-                print(f"[国际服] 拉到最新 {len(intl_prices)} 个通货价格，已更新备份表")
+                intl_latest = poe_ninja.fetch_international_prices(game, league)
+                print(f"[国际服] 拉到最新 {len(intl_latest)} 个通货价格")
             except Exception as e:  # noqa: BLE001
-                if backup_prices is not None:
-                    intl_prices = backup_prices
-                    print(f"[WARN] 抓取国际服价失败（{e}），回退用备份表 {len(intl_prices)} 个价格")
-                else:
-                    print(f"[错误] {game} 抓取国际服价失败：{e}，跳过")
-                    continue
-        else:
-            intl_prices = backup_prices
-            print(f"[国际服] 使用备份表 {len(intl_prices)} 个通货价格（过滤器未更新）")
+                print(f"[WARN] 拉取国际服价失败（{e}），需更新的格式组将回退用快照")
 
-        # 3. 逐个文件处理
-        for filter_path in filter_files:
-            try:
-                process_one(filter_path, game, args, cn_prices, intl_prices, anchors, price_fields)
-            except Exception as e:  # noqa: BLE001
-                print(f"  [错误] 处理 {filter_path.name} 失败：{e}")
+        # 6. 确定每组国际服价 + 更新快照
+        intl_by_fmt = {}
+        for fmt, files in groups.items():
+            backup_path = intl_backup_path(directory, fmt)
+            backup_prices, _ = load_intl_backup(backup_path)
+            if fmt in need_fetch and intl_latest is not None:
+                intl_by_fmt[fmt] = intl_latest
+                save_intl_backup(backup_path, league, intl_latest)
+                print(f"[国际服] {fmt} 快照已更新（{len(intl_latest)} 个价格）")
+            elif backup_prices is not None:
+                intl_by_fmt[fmt] = backup_prices
+                print(f"[国际服] {fmt} 使用快照 {len(backup_prices)} 个价格（过滤器未更新）")
+            else:
+                print(f"[错误] {fmt} 无国际服价（快照缺失且拉取失败），跳过该组")
+
+        # 7. 逐个文件处理
+        for fmt, files in groups.items():
+            if fmt not in intl_by_fmt:
+                continue
+            intl_prices = intl_by_fmt[fmt]
+            for fp in files:
+                try:
+                    process_one(fp, game, args, cn_prices, intl_prices, anchors, price_fields)
+                except Exception as e:  # noqa: BLE001
+                    print(f"  [错误] 处理 {fp.name} 失败：{e}")
 
 
 if __name__ == "__main__":
