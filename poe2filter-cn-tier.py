@@ -837,7 +837,8 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
                     n_changed += 1
                 proms_str = ", ".join(f"{n}+→{t}" for n, t in promotions) or "-"
                 vc = fmt_price(cn_value, fac)
-                detail_rows.append((title, bt, old_rec["base"], base, vc, proms_str))
+                detail_rows.append((title, bt, old_rec["base"], base, vc, proms_str,
+                                    cn_value if cn_value is not None else -1.0))
 
         total_items += n_items
         total_changed += n_changed
@@ -855,12 +856,13 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
         for title, bt, old_tier in removed_rows:
             print(f"  - {cn_of(bt)} {bt}（原 {old_tier} 档，段「{title}」）")
 
-    # 变更明细（默认输出：只列 tier 发生变化的道具）
+    # 变更明细（默认输出：只列 tier 发生变化的道具，按价格降序）
     changed_rows = [r for r in detail_rows if r[2] != r[3]]
+    changed_rows.sort(key=lambda r: r[6], reverse=True)
     if changed_rows:
         print(f"\n=== 变更明细（{len(changed_rows)} 个 tier 变化） ===")
         print(_wpad("段", 18) + _wpad("中文", 18) + _wpad("英文", 32) + _wpad("旧 → 新", 10) + "价格")
-        for title, name, old_tier, new_tier, vc, proms in changed_rows:
+        for title, name, old_tier, new_tier, vc, proms, _p in changed_rows:
             print(_wpad(title, 18) + _wpad(cn_of(name), 18) + _wpad(name, 32)
                   + _wpad(f"{old_tier or '-'} → {new_tier}", 10) + vc)
     else:
@@ -873,10 +875,10 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
         print(f"{title:<24}{n_items:>6}{n_changed:>8}")
 
     if verbose:
-        print("\n=== 详细对照表 ===")
+        print("\n=== 详细对照表（按价格降序） ===")
         print(_wpad("段", 18) + _wpad("中文", 18) + _wpad("英文", 30)
               + _wpad("旧", 4) + _wpad("新", 4) + _wpad("价格", 18) + "堆叠升档")
-        for title, name, old_tier, new_tier, vc, proms in detail_rows:
+        for title, name, old_tier, new_tier, vc, proms, _p in sorted(detail_rows, key=lambda r: r[6], reverse=True):
             mark = "" if old_tier == new_tier else " *"
             print(_wpad(title, 18) + _wpad(cn_of(name), 18) + _wpad(name, 30)
                   + _wpad(old_tier or "-", 4) + _wpad(new_tier, 4) + _wpad(vc, 18)
@@ -1139,11 +1141,15 @@ def main(argv=None):
 
         # 8. 标志通货兑换比例（C/D/E 全变种 + 发辫 + 镜子）
         fac = compute_unit_factors(cn_prices, game, anchors, price_fields)
-        print(f"\n=== 标志通货兑换比例 [{game.upper()}] ===")
+        print(f"\n=== 标志通货兑换比例 [{game.upper()}]（按价格降序） ===")
+        rows = []
         for name in BENCHMARK_NAMES:
             it = cn_prices.get(normalize_name(name))
             v = cn_value_in_chaos(game, it, anchors, price_fields) if it else None
             cn = (it.get("item_name") or "-") if it else "-"
+            rows.append((v if v is not None else -1.0, cn, name, v))
+        rows.sort(key=lambda r: r[0], reverse=True)
+        for _p, cn, name, v in rows:
             print("  " + _wpad(cn, 14) + _wpad(name, 26) + fmt_price(v, fac))
 
 
