@@ -95,57 +95,6 @@ EXALTED_NAME = "Exalted Orb"  # e 计价基准（崇高石）
 # 锚定通货（相对判定里，这三个标志通货钉在原档位，不随汇率浮动）
 ANCHOR_NAMES = {CHAOS_NAME, DIVINE_NAME, EXALTED_NAME}
 
-# 白名单：国服「有」但 poecurrency.top 没收录价格的通货（基础通货/碎片/催化剂等）。
-# 这些国服游戏里肯定存在，只是 API 没价格；删除时按白名单保留原档，防误删。
-KEEP_WHITELIST = {
-    # 通用基础通货（POE1 + POE2 都有）
-    "Scroll of Wisdom",
-    "Orb of Alchemy",
-    "Orb of Transmutation",
-    "Orb of Binding",
-    "Blessed Orb",
-    "Jeweller's Orb",
-    "Blacksmith's Whetstone",
-    "Armourer's Scrap",
-    "Portal Scroll",
-    # POE2 碎片（shard）
-    "Artificer's Shard",
-    "Chance Shard",
-    "Regal Shard",
-    "Transmutation Shard",
-    "Fracturing Shard",
-    # POE2 献祭石（Ritual）
-    "Kamasa's Orb of Sacrifice",
-    "Kopec's Orb of Sacrifice",
-    "Yaomac's Orb of Sacrifice",
-    "Yugul's Orb of Sacrifice",
-    # POE1 催化剂（Catalyst，国服有）
-    "Abrasive Catalyst",
-    "Accelerating Catalyst",
-    "Fertile Catalyst",
-    "Imbued Catalyst",
-    "Intrinsic Catalyst",
-    "Noxious Catalyst",
-    "Prismatic Catalyst",
-    "Tempering Catalyst",
-    "Turbulent Catalyst",
-    "Unstable Catalyst",
-    "Tainted Catalyst",
-    # POE1 生命之力（Lifeforce，Harvest，国服有）
-    "Primal Lifeforce",
-    "Sacred Lifeforce",
-    "Sandswept Lifeforce",
-    "Vivid Lifeforce",
-    "Wild Lifeforce",
-    # POE1 其他稳定通货（国服有）
-    "Enkindling Orb",
-    "Instilling Orb",
-    "Reflecting Mist",
-    "Rogue's Marker",
-    "Tainted Divine Orb",
-    "Tainted Jeweller's Orb",
-}
-
 # 要处理的区域：从 "Tiered Currency Rules" 之后，到 "Bottom Free-text Rules" 之前。
 # 之前的 Uniques/Gear/Jewellery 等装备段、以及 "Currency Rules"（Gold 规则）都不处理。
 AREA_START = "Tiered Currency Rules"
@@ -154,12 +103,8 @@ AREA_END = ("Bottom Free-text Rules", "Filter Configuration")
 
 # ============================== 数据获取 ==============================
 
-def load_api_token():
-    """默认尝试从脚本同目录 import poe2filter-cn-tier-config.py，读取其中的 API_TOKEN。
-
-    存在且是有效 token 就返回；否则返回 None（走免费 summary 接口）。
-    整个 import 用 try 包住，文件缺失 / 语法错 / 无 API_TOKEN 都不报错。
-    """
+def _load_config_module():
+    """尝试 import 同目录的 config 文件，返回模块对象；失败返回 None。"""
     script_dir = Path(__file__).resolve().parent
     config_path = script_dir / CONFIG_FILE
     if not config_path.exists():
@@ -170,13 +115,36 @@ def load_api_token():
         )
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        token = getattr(mod, "API_TOKEN", None)
+        return mod
     except Exception as e:  # noqa: BLE001
         print(f"[WARN] 读取 {CONFIG_FILE} 失败：{e}")
         return None
+
+
+def load_api_token():
+    """从 config 文件读取 API_TOKEN。有效则返回 token，否则 None。"""
+    mod = _load_config_module()
+    if mod is None:
+        return None
+    token = getattr(mod, "API_TOKEN", None)
     if isinstance(token, str) and token.strip() and not token.strip().lower().startswith("xxxxx"):
         return token.strip()
     return None
+
+
+def load_remove_items():
+    """从 config 文件读取 REMOVE_ITEMS（确需删除的道具集合，默认空）。
+
+    这些是「国服确实没有」的道具（国际服多出、国服未更新），
+    过滤器里出现会导致导入国服加载失败，需要删除。默认空 = 不删除任何道具。
+    """
+    mod = _load_config_module()
+    if mod is None:
+        return set()
+    items = getattr(mod, "REMOVE_ITEMS", None)
+    if isinstance(items, (set, list, tuple)):
+        return {str(x) for x in items if x}
+    return set()
 
 
 def http_get_json(url, timeout=30):
@@ -719,10 +687,11 @@ def make_output_path(filter_path, explicit_output):
     return p.with_name("[CN]" + p.name)
 
 
-def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, verbose):
+def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_items, verbose):
     """相对判定重新分级（共享逻辑），返回 (new_assignments, total_items, total_changed)。
 
-    处理前先删除「国服查不到」的道具（国际服多出的物品会导致过滤器导入国服后加载失败）。
+    只删除「黑名单」（配置里 REMOVE_ITEMS）列出的道具（国服确实没有的，防加载失败）；
+    其余（含国服查不到价的道具）都保留原档。
     """
     new_assignments = {}
     total_items = 0
@@ -731,15 +700,15 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, verbose
     removed_rows = []
     section_summary = []
     detail_rows = []
-    keep_norm = {normalize_name(n) for n in KEEP_WHITELIST}
+    remove_norm = {normalize_name(n) for n in remove_items}
 
     for title, start, end, groups in parsed:
         n_items = 0
         n_changed = 0
         for grp in groups:
-            # 1) 删除国服查不到的道具（一个 rule 里多个道具只删不存在的；白名单保留）
+            # 1) 删除黑名单（REMOVE_ITEMS）里的道具（国服确实没有的）
             for bt in list(grp["currencies"]):
-                if normalize_name(bt) not in cn_prices and normalize_name(bt) not in keep_norm:
+                if normalize_name(bt) in remove_norm:
                     old_tier = grp["currencies"][bt]["base"]
                     del grp["currencies"][bt]
                     total_removed += 1
@@ -772,7 +741,7 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, verbose
 
     # 打印删除信息
     if removed_rows:
-        print(f"\n[删除] 国服查不到的 {total_removed} 个道具（已移除，防加载失败）:")
+        print(f"\n[删除] 移除 {total_removed} 个黑名单道具（防加载失败）:")
         for title, bt, old_tier in removed_rows:
             print(f"  - {bt}（原 {old_tier} 档，段「{title}」）")
 
@@ -792,7 +761,7 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, verbose
 
     print(
         f"[统计] 共 {total_items} 个通货类物品，其中 {total_changed} 个 tier 发生变化，"
-        f"{total_items - total_changed} 个不变，删除 {total_removed} 个国服查不到的道具"
+        f"{total_items - total_changed} 个不变，删除 {total_removed} 个黑名单道具"
     )
 
     return new_assignments, total_items, total_changed
@@ -848,7 +817,7 @@ def scan_filters(directory):
     return files
 
 
-def process_one(filter_path, game, args, cn_prices, intl_prices, anchors, price_fields):
+def process_one(filter_path, game, args, cn_prices, intl_prices, anchors, price_fields, remove_items):
     """处理单个过滤器文件（识别格式 → 解析 → 重分级 → 生成 → 写回）。"""
     print(f"\n--- 处理: {filter_path.name} ---")
 
@@ -889,9 +858,9 @@ def process_one(filter_path, game, args, cn_prices, intl_prices, anchors, price_
         groups, tier_display, blocks = parse_filterblade(lines)
         parsed = [("filterblade", 0, 0, groups)]
 
-    # 相对判定重新分级（含删除国服查不到的道具）
+    # 相对判定重新分级（只删除黑名单道具）
     new_assignments, _, _ = re_tier(
-        parsed, cn_prices, intl_prices, game, anchors, price_fields, args.verbose,
+        parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_items, args.verbose,
     )
 
     # 按格式重新生成并写回
@@ -935,6 +904,7 @@ def main(argv=None):
     # 取值字段顺序：用户选的字段排最前，其余兜底
     price_fields = [args.price_field] + [f for f in PRICE_FIELDS if f != args.price_field]
     token = args.token if args.token else load_api_token()
+    remove_items = load_remove_items()
 
     games = ["poe1", "poe2"] if args.game == "both" else [args.game]
     dir_overrides = {"poe1": args.poe1_dir, "poe2": args.poe2_dir}
@@ -1025,7 +995,7 @@ def main(argv=None):
             intl_prices = intl_by_fmt[fmt]
             for fp in files:
                 try:
-                    process_one(fp, game, args, cn_prices, intl_prices, anchors, price_fields)
+                    process_one(fp, game, args, cn_prices, intl_prices, anchors, price_fields, remove_items)
                 except Exception as e:  # noqa: BLE001
                     print(f"  [错误] 处理 {fp.name} 失败：{e}")
 
