@@ -745,6 +745,16 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
         for title, bt, old_tier in removed_rows:
             print(f"  - {bt}（原 {old_tier} 档，段「{title}」）")
 
+    # 变更明细（默认输出：只列 tier 发生变化的道具）
+    changed_rows = [r for r in detail_rows if r[2] != r[3]]
+    if changed_rows:
+        print(f"\n=== 变更明细（{len(changed_rows)} 个 tier 变化） ===")
+        print(f"{'段':<24}{'通货':<32}{'旧档':>4} → {'新档':<4}")
+        for title, name, old_tier, new_tier, vc, proms in changed_rows:
+            print(f"{title:<24}{name:<32}{old_tier or '-':>4} → {new_tier:<4}")
+    else:
+        print("\n[变更明细] 无 tier 变化")
+
     # 打印汇总
     print("\n=== 各段重新分级汇总 ===")
     print(f"{'段':<24}{'物品数':>6}{'变动数':>8}")
