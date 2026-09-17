@@ -246,11 +246,11 @@ def compute_unit_factors(cn_prices, game, anchors, price_fields):
 
 
 def fmt_price(v_c, fac):
-    """价格格式化：优先显示最近的一级单位（C/D/E），括号里附 C 值。
+    """价格格式化：按「最近一级单位」标价，括号里附 C 值。
 
     - ≥1D："{x}D({y}C)"
-    - ≤1E："{x}E({y}C)"（不足 1E 时自然是 0.xxxE）
-    - 其余（1E~1D）："{x}C"（单位就是 C，不需括号）
+    - ≥1C（不足 1D）："{x}C"
+    - <1C（含不足 1E）："{x}E({y}C)"（不足 1E 时自然是 0.xxxE）
     """
     if v_c is None:
         return "-"
@@ -260,7 +260,9 @@ def fmt_price(v_c, fac):
     tol = 1e-9
     if d and v_c >= d * (1 - tol):
         return f"{_fmt_num(v_c / d)}D({c_s})"
-    if e and e > 0 and v_c <= e * (1 + tol):
+    if v_c >= 1 - tol:
+        return c_s
+    if e and e > 0:
         return f"{_fmt_num(v_c / e)}E({c_s})"
     return c_s
 
