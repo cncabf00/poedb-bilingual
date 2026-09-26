@@ -132,12 +132,31 @@ HYBRID_FIELDS_LIQUID = ("buy_avg", "buy_avg_24h", "sell_avg", "sell_avg_24h",
 HYBRID_FIELDS_THIN = ("sell_avg", "sell_avg_24h", "sell_avg_yesterday",
                       "buy_avg", "buy_avg_24h", "latest_sell1", "latest_buy1")
 
-# 「碎片 → 成品」的合成关系：碎片价值不应低于「成品价 ÷ 份数」
-# （低于这个价，合成套利会把价拉回去；成品价同样按 hybrid 顺序取）。
-# 格式：{碎片英文名（过滤器 BaseType）: (成品英文名, 份数)}
+# 「碎片 → 成品」合成兜底表：碎片价值 = max(自身价, 成品价 ÷ count)
+# （低于这个价，合成套利会把价拉回去；成品价同样按 hybrid 顺序取）
+# 名称一律用过滤器里的英文名（BaseType）；**按游戏分表**（同名道具两代配方可能不同）。
+# 每条形如：{"parent": 成品英文名, "count": 份数, "note": 备注（可选）}
+# 副作用：命中的碎片同时视为「价格可信」——即使自身挂单单边，也不再保留原档。
+# 新增一条只需在对应游戏下加一行；启动时会校验名字/份数，缺失会打 [WARN]。
 CRAFT_RATIOS = {
-    "Simulacrum Splinter": ("Simulacrum", 300),
-    "Breach Splinter": ("Breachstone", 300),
+    "poe2": {
+        "Simulacrum Splinter": {"parent": "Simulacrum", "count": 300},
+        "Breach Splinter": {
+            "parent": "Breachstone", "count": 300,
+            "note": "300 裂片 + 其他材料 = 裂隙石，暂按 ÷300",
+        },
+    },
+    "poe1": {
+        "Crescent Splinter": {
+            "parent": "The Maven's Writ", "count": 10,
+            "note": "游戏内描述：10 个合成 1 个 The Maven's Writ",
+        },
+        # 待主人确认份数后启用（经济性推算 ≤126，一代惯例 100）：
+        # "Ritual Splinter": {"parent": "Ritual Vessel", "count": 100,
+        #                     "note": "份数待确认"},
+        # 一代另有 Splinter of Xoph/Tul/Esh/Uul-Netol/Chayula 系列（100 → 对应裂隙之石），
+        # 名字形态为 "Splinter of X" 而非 "X Splinter"，且当前国服价格数据里没有，待确认。
+    },
 }
 
 # 末尾附「兑换比例」的名称（C/D/E 全变种 + 点金/机会/瓦尔 + 蜕变/增幅 + 发辫 + 镜子）
@@ -519,18 +538,40 @@ def hybrid_price_fields(item, volumes, floors, anchors, base_fields):
 
 def craft_derived_value(game, name, cn_prices, anchors, volumes, floors, price_fields):
     """按合成关系算出碎片的「成品价 ÷ 份数」下限；无规则或拿不到成品价时返回 None。"""
-    rule = CRAFT_RATIOS.get(name)
-    if not rule:
+    rule = (CRAFT_RATIOS.get(game) or {}).get(name)
+    if not isinstance(rule, dict):
         return None
-    parent_name, ratio = rule
+    parent_name = rule.get("parent")
+    ratio = rule.get("count")
+    if not parent_name or not ratio:
+        return None
     parent = cn_prices.get(normalize_name(parent_name))
-    if parent is None or not ratio:
+    if parent is None:
         return None
     parent_fields = hybrid_price_fields(parent, volumes, floors, anchors, price_fields)
     parent_value = cn_value_in_chaos(game, parent, anchors, parent_fields)
     if not parent_value:
         return None
     return parent_value / ratio
+
+
+def validate_craft_ratios(game, cn_prices):
+    """启动时校验合成兜底表：名字/份数不对就提示，避免填错后静默失效。"""
+    table = CRAFT_RATIOS.get(game) or {}
+    if not table:
+        return
+    for name, rule in table.items():
+        if not isinstance(rule, dict):
+            print(f"[WARN] 合成兜底表（{game}）{name}：条目格式不对（应为 dict），已跳过")
+            continue
+        parent, count = rule.get("parent"), rule.get("count")
+        if not parent or not count:
+            print(f"[WARN] 合成兜底表（{game}）{name}：缺 parent 或 count，已跳过")
+            continue
+        if cn_prices.get(normalize_name(name)) is None:
+            print(f"[WARN] 合成兜底表（{game}）{name}：国服价格数据里找不到这个碎片，条目暂不生效")
+        if cn_prices.get(normalize_name(parent)) is None:
+            print(f"[WARN] 合成兜底表（{game}）{name}：找不到成品「{parent}」，条目暂不生效")
 
 
 def compute_floors(cn_prices, anchor_tiers, game, anchors, price_fields):
@@ -947,6 +988,7 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
     n_liquid = 0
     n_thin = 0
     n_craft = 0
+    craft_rows = []
     removed_rows = []
     unreliable_rows = []
     section_summary = []
@@ -996,6 +1038,7 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
                 )
                 if craft_value is not None:
                     n_craft += 1
+                    craft_rows.append((bt, cn_value, craft_value))
                     cn_value = craft_value if cn_value is None else max(cn_value, craft_value)
                 if bt not in ANCHOR_NAMES and not price_is_reliable(item) and craft_value is None:
                     # 价格不可信（只有单边挂单、历史窗口也查不到双边）：
@@ -1090,7 +1133,10 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
             f"有量 → buy_avg 优先 {n_liquid} 个；无量 → sell_avg 优先 {n_thin} 个"
         )
     if n_craft:
-        print(f"[合成兜底] {n_craft} 个碎片按「成品价 ÷ 份数」兜底（取自身价与合成价较高者）")
+        print(f"[合成兜底] {n_craft} 个碎片按「成品价 ÷ 份数」兜底（取自身价与合成价较高者）:")
+        for bt, own, derived in sorted(craft_rows, key=lambda r: -(r[2] or 0)):
+            own_s = fmt_price(own, fac) if own is not None else "-"
+            print(f"  - {cn_of(bt)} {bt}：自身 {own_s} / 合成价 {fmt_price(derived, fac)}")
 
     return new_assignments, total_items, total_changed
 
@@ -1277,6 +1323,7 @@ def main(argv=None):
         try:
             cn_prices = fetch_prices(game, token)
             anchors = compute_anchors(game, cn_prices, price_fields)
+            validate_craft_ratios(game, cn_prices)
             volumes = fetch_cn_volumes(game, token)
             if volumes:
                 print(f"[hybrid] 拉到 {len(volumes)} 个道具的挂单量（阈值档位：{HYBRID_VOLUME_TIER or '关闭'}）")
