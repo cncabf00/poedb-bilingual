@@ -120,12 +120,14 @@ HISTORY_SIDE_FIELDS = (
 #     buy_avg  = 你要买入的价（对应游戏里的「出售挂单」，通常价高、挂单量小）
 #     sell_avg = 你能卖到的价（对应游戏里的「求购单」，价低、往往有量）
 #   所以：有真金白银在收的道具，挂 buy_avg 也卖得掉；没人收的，只有 sell_avg 能立刻成交。
-# 流动性指标 = 求购侧挂单总价值 = Σ(sellᵢ_vol)
-# （sell*_vol 本身就是**价值**，单位同 currency_unit；件数 = vol ÷ 单价。
-#   例：单价 40E、vol 320 → 320E 总价值，折合 8 个）。
-# 求购价值（折算成混沌）≥ 该档下限 → buy_avg 优先；否则 sell_avg 优先。
-# 阈值档位可改（默认 S：求购总额够得上 S 档门槛就算有量）；设 None 关闭 hybrid。
+# 流动性指标 = 求购侧挂单的货币总量 = Σ(sellᵢ_vol)
+# （sell*_vol = 该挂单里**有多少个通货**；求购那行就是多少个支付货币（如崇高石），
+#   也就是货币总量/价值，单位同 currency_unit。件数 = vol ÷ 单价）。
+# 求购总价值（折算混沌）≥ 该档下限 × 倍数 → buy_avg 优先；否则 sell_avg 优先。
+# 阈值档位可改（默认 S）；设 None 关闭 hybrid。倍数默认 10：
+#   1 倍太松（S 档下限才几十 C 的量，求购数太少、基本不流通），10 倍才说明真有资金在收。
 HYBRID_VOLUME_TIER = "S"
+HYBRID_VOLUME_MULTIPLIER = 10
 
 # hybrid 两套取值顺序（第一个非零字段生效；当前无值就往前退到历史窗口）
 HYBRID_FIELDS_LIQUID = ("buy_avg", "buy_avg_24h", "sell_avg", "sell_avg_24h",
@@ -575,6 +577,7 @@ def hybrid_price_fields(item, volumes, floors, anchors, base_fields):
     floor = floors.get(HYBRID_VOLUME_TIER)
     if floor is None:
         return base_fields
+    floor *= HYBRID_VOLUME_MULTIPLIER
     vol = volumes.get(normalize_name(item.get("engname") or ""))
     if not vol:
         return base_fields
@@ -1178,7 +1181,7 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
     )
     if n_liquid or n_thin:
         print(
-            f"[hybrid] 按求购侧价值（阈值 = {HYBRID_VOLUME_TIER} 档下限）取值："
+            f"[hybrid] 按求购侧价值（阈值 = {HYBRID_VOLUME_TIER} 档下限 × {HYBRID_VOLUME_MULTIPLIER}）取值："
             f"有量 → buy_avg 优先 {n_liquid} 个；无量 → sell_avg 优先 {n_thin} 个"
         )
     if n_craft:
@@ -1375,7 +1378,8 @@ def main(argv=None):
             validate_craft_ratios(game, cn_prices)
             volumes = fetch_cn_volumes(game, token)
             if volumes:
-                print(f"[hybrid] 拉到 {len(volumes)} 个道具的挂单量（阈值档位：{HYBRID_VOLUME_TIER or '关闭'}）")
+                print(f"[hybrid] 拉到 {len(volumes)} 个道具的挂单量"
+                      f"（阈值档位：{HYBRID_VOLUME_TIER or '关闭'} × {HYBRID_VOLUME_MULTIPLIER}）")
         except Exception as e:  # noqa: BLE001
             print(f"[错误] {game} 抓取国服价失败：{e}，跳过")
             continue
