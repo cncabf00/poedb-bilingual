@@ -120,9 +120,9 @@ HISTORY_SIDE_FIELDS = (
 #     buy_avg  = 你要买入的价（对应游戏里的「出售挂单」，通常价高、挂单量小）
 #     sell_avg = 你能卖到的价（对应游戏里的「求购单」，价低、往往有量）
 #   所以：有真金白银在收的道具，挂 buy_avg 也卖得掉；没人收的，只有 sell_avg 能立刻成交。
-# 流动性指标 = 求购侧价值（sell1~5_vol 求和；已用数据校验：sell*_vol 是「价值数」= 件数 × 单价，
-# 而 buy*_vol 更像「件数」，两侧口径不一致，所以只用求购侧）。
-# 求购价值（折算混沌）≥ 该档下限 → buy_avg 优先；否则 sell_avg 优先。
+# 流动性指标 = 求购侧挂单总价值 = Σ(sellᵢ × sellᵢ_vol)
+# （*_vol 是该挂单里通货的**个数**，不是单数、也不是价值，所以必须自己乘单价）。
+# 求购价值（折算成混沌）≥ 该档下限 → buy_avg 优先；否则 sell_avg 优先。
 # 阈值档位可改（默认 S：求购总额够得上 S 档门槛就算有量）；设 None 关闭 hybrid。
 HYBRID_VOLUME_TIER = "S"
 
@@ -314,8 +314,8 @@ def fetch_cn_volumes(game, token=None):
 
     返回 {归一化英文名: {"sell_value": 求购侧价值, "buy_units": 买侧件数}}；失败返回 {}。
 
-    口径注意（已用数据校验）：sell*_vol 是「价值数」（= 件数 × 单价，单位随 currency_unit），
-    而 buy*_vol 更像「件数」——两侧口径不一致，所以 hybrid 只用求购侧价值当流动性指标。
+    口径（主人核实）：*_vol 是「该挂单里通货的个数」—— 不是单数、也不是价值。
+    所以要得到挂单总价值必须自己乘单价：Σ(单价 × 数量)。
     无 token 时该接口只允许查最近 24 小时，这里取 2 小时（覆盖最近一条即可）。
     """
     version = "1" if game == "poe1" else "2"
@@ -340,7 +340,13 @@ def fetch_cn_volumes(game, token=None):
         if not key:
             continue
         out[key] = {
-            "sell_value": sum((r.get(f"sell{i}_vol") or 0) for i in range(1, 6)),
+            # 求购侧挂单总价值 = Σ(单价 × 数量)，用于和阈值（货币量）比较
+            "sell_value": sum(
+                (r.get(f"sell{i}") or 0) * (r.get(f"sell{i}_vol") or 0) for i in range(1, 6)
+            ),
+            # 求购侧挂单总数量（件）
+            "sell_units": sum((r.get(f"sell{i}_vol") or 0) for i in range(1, 6)),
+            # 买侧挂单总数量（件）
             "buy_units": sum((r.get(f"buy{i}_vol") or 0) for i in range(1, 6)),
         }
     return out
