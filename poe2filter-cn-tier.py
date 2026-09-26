@@ -172,7 +172,8 @@ CRAFT_RATIOS = {
 }
 
 # 末尾附「兑换比例」的名称（C/D/E 全变种 + 点金/机会/瓦尔 + 蜕变/增幅 + 发辫 + 镜子）
-BENCHMARK_NAMES = [
+# 两代共用部分；不在国服价格数据里的名字，打印时会自动跳过。
+BENCHMARK_NAMES_COMMON = [
     "Chaos Orb", "Greater Chaos Orb", "Perfect Chaos Orb",
     "Divine Orb",
     "Exalted Orb", "Greater Exalted Orb", "Perfect Exalted Orb",
@@ -181,6 +182,32 @@ BENCHMARK_NAMES = [
     "Orb of Augmentation", "Greater Orb of Augmentation", "Perfect Orb of Augmentation",
     "Hinekora's Lock", "Mirror of Kalandra",
 ]
+
+# 各代补充：只有某代才有的重要通货（缺数据的会自动跳过，不会报错）
+BENCHMARK_NAMES_EXTRA = {
+    "poe2": [
+        "Orb of Annulment",        # 剥离石
+        "Fracturing Orb",          # 破溃宝珠
+        "Lesser Jeweller's Orb", "Greater Jeweller's Orb", "Perfect Jeweller's Orb",  # 工匠石
+    ],
+    "poe1": [
+        "Orb of Alteration",       # 改造石
+        "Ancient Orb",             # 远古石
+        "Volatile Vaal Orb",       # 无常瓦尔宝珠
+        "Orb of Annulment",        # 剥离石
+        "Orb of Fusing",           # 链结石（链接石）
+        "Orb of Regret",           # 后悔石
+        "Orb of Unmaking",         # 粉碎石
+        "Chromatic Orb",           # 幻色石
+        "Fracturing Orb",          # 破溃宝珠
+        "Fracturing Shard",        # 破溃宝珠碎片（仅一代；待数据确认）
+        "Mirror Shard",            # 卡兰德的魔镜碎片
+        "Jeweller's Orb",          # 工匠石
+        "Reflective Mist",         # 倒映薄雾
+    ],
+}
+
+BENCHMARK_NAMES = BENCHMARK_NAMES_COMMON  # 兼容旧引用
 
 # 要处理的区域：从 "Tiered Currency Rules" 之后，到 "Bottom Free-text Rules" 之前。
 # 之前的 Uniques/Gear/Jewellery 等装备段、以及 "Currency Rules"（Gold 规则）都不处理。
@@ -1412,7 +1439,7 @@ def main(argv=None):
         fac = compute_unit_factors(cn_prices, game, anchors, price_fields)
         print(f"\n=== 标志通货兑换比例 [{game.upper()}]（按价格降序） ===")
         rows = []
-        for name in BENCHMARK_NAMES:
+        for name in BENCHMARK_NAMES_COMMON + BENCHMARK_NAMES_EXTRA.get(game, []):
             it = cn_prices.get(normalize_name(name))
             v = cn_value_in_chaos(game, it, anchors, price_fields) if it else None
             cn = (it.get("item_name") or "-") if it else "-"
