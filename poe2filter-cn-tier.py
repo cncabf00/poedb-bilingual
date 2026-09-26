@@ -99,11 +99,21 @@ ANCHOR_NAMES = {CHAOS_NAME, DIVINE_NAME, EXALTED_NAME, PERFECT_EXALTED_NAME}
 ANCHOR_DISCOUNT = 0.7   # 档位下限 = 标志通货价 × 0.7（下浮 30%）
 TIER_STEP = 3.0          # 无标志通货的档位：相邻档 ×3 / ÷3
 
-# 价格可信度：接口必须买、卖两侧都有挂单（latest_buy1 与 latest_sell1 都 > 0）。
+# 价格可信度：接口必须买、卖两侧都有挂单 —— 最新挂单两侧都有，**或**历史窗口（12h / 24h /
+# 昨日）内曾出现两侧。
 # 只有单边挂单时（典型：本赛季已不存在的道具，只剩上赛季残留买盘），
 # 那个均价是「虚空报价」，不代表市场价 —— 用它重分级会把道具误降/误升。
-# 这类道具一律保留原档、不参与重分级（标志通货不受此限，它们本就钉在原档）。
+# 但「批量收货」类道具（裂片、符文、灵核、催化剂等）天然只有买盘挂着：当下单边
+# 不等于市场是假的，所以回退看历史窗口，曾双边即视为可信（否则会误伤这类真实道具）。
+# 仍判不可信的道具：基础档与源文件里的堆叠规则一律原样保留（不重分级、不重建规则）。
 REQUIRE_BOTH_SIDES = True
+
+# 单边挂单时的历史兜底窗口：(买方字段, 卖方字段)；任一窗口两侧都有值即视为可信。
+HISTORY_SIDE_FIELDS = (
+    ("buy_avg_12h", "sell_avg_12h"),
+    ("buy_avg_24h", "sell_avg_24h"),
+    ("buy_avg_yesterday", "sell_avg_yesterday"),
+)
 
 # 末尾附「兑换比例」的名称（C/D/E 全变种 + 点金/机会/瓦尔 + 蜕变/增幅 + 发辫 + 镜子）
 BENCHMARK_NAMES = [
@@ -394,15 +404,23 @@ def cn_value_in_chaos(game, item, anchors, price_fields):
 # ============================== 分级（锚定标志通货 + 估算） ==============================
 
 def price_is_reliable(item):
-    """价格是否可信：买卖两侧挂单都有（latest_buy1 > 0 且 latest_sell1 > 0）。
+    """价格是否可信：买卖两侧都有挂单。
 
-    只有单边挂单时（典型：本赛季已不存在、只剩上赛季残留买盘的道具），
-    接口给的均价是「虚空报价」，不能拿来重分级。item 为 None 时交给
-    cn_value_in_chaos 的既有逻辑处理（查不到价 → 保留原档）。
+    先看最新挂单（latest_buy1 与 latest_sell1 都 > 0）；若当下只有单边，
+    再回退看历史窗口（HISTORY_SIDE_FIELDS：12h / 24h / 昨日），任一窗口两侧都有值
+    即视为可信 —— 批量收货类道具（裂片、符文等）常常当下没有卖单挂着，
+    但历史窗口里有双边成交，拦掉它们是误伤。
+    两个都查不到（全是单边或没有数据）才判不可信，避免拿「虚空报价」重分级。
+    item 为 None 时交给 cn_value_in_chaos 的既有逻辑处理（查不到价 → 保留原档）。
     """
     if not REQUIRE_BOTH_SIDES or item is None:
         return True
-    return bool(item.get("latest_buy1")) and bool(item.get("latest_sell1"))
+    if item.get("latest_buy1") and item.get("latest_sell1"):
+        return True
+    for buy_field, sell_field in HISTORY_SIDE_FIELDS:
+        if item.get(buy_field) and item.get(sell_field):
+            return True
+    return False
 
 
 def compute_floors(cn_prices, anchor_tiers, game, anchors, price_fields):
@@ -807,7 +825,8 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
 
     只删除「黑名单」（配置里 REMOVE_ITEMS）列出的道具（国服确实没有的，防加载失败）；
     其余（含国服查不到价的道具）都保留原档。
-    价格不可信（挂单只有单边，见 price_is_reliable）的道具同样保留原档。
+    价格不可信（单边挂单且历史窗口也没有双边，见 price_is_reliable）的道具：
+    基础档与堆叠规则都原样保留，不参与重分级、也不重建规则。
     """
     new_assignments = {}
     total_items = 0
@@ -852,8 +871,10 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
                 item = cn_prices.get(normalize_name(bt))
                 cn_value = cn_value_in_chaos(game, item, anchors, price_fields)
                 if bt not in ANCHOR_NAMES and not price_is_reliable(item):
-                    # 价格不可信（挂单只有单边）：保留原档，也不做堆叠升档
-                    base, promotions = old_rec["base"], []
+                    # 价格不可信（只有单边挂单、历史窗口也查不到双边）：
+                    # 基础档与源文件里的堆叠规则都原样保留（不重分级、也不重建）
+                    base = old_rec["base"]
+                    promotions = list(old_rec.get("promotions") or [])
                     unreliable_rows.append((title, bt, old_rec["base"], cn_value, item))
                 else:
                     base, promotions = assign_currency(
@@ -886,7 +907,7 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
 
     # 打印价格不可信（挂单只有单边）的跳过信息
     if unreliable_rows:
-        print(f"\n[价格不可信] {len(unreliable_rows)} 个道具挂单只有单边，保留原档不重分级:")
+        print(f"\n[价格不可信] {len(unreliable_rows)} 个道具只有单边挂单（历史窗口也无双边），保留原档与原堆叠规则:")
         print(_wpad("段", 18) + _wpad("中文", 18) + _wpad("英文", 40) + _wpad("原档", 4)
               + _wpad("接口均价", 16) + "买1 / 卖1")
         for title, bt, old_tier, value, item in sorted(
@@ -934,7 +955,7 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
     print(
         f"[统计] 共 {total_items} 个通货类物品，其中 {total_changed} 个 tier 发生变化，"
         f"{total_items - total_changed} 个不变，删除 {total_removed} 个黑名单道具，"
-        f"{len(unreliable_rows)} 个因价格不可信（单边挂单）保留原档"
+        f"{len(unreliable_rows)} 个因价格不可信（仅单边挂单）保留原档与原堆叠规则"
     )
 
     return new_assignments, total_items, total_changed
