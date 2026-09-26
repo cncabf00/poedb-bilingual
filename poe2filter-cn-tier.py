@@ -126,9 +126,19 @@ HISTORY_SIDE_FIELDS = (
 # 阈值档位可改（默认 S：求购总额够得上 S 档门槛就算有量）；设 None 关闭 hybrid。
 HYBRID_VOLUME_TIER = "S"
 
-# hybrid 两套取值顺序（第一个非零字段生效）
-HYBRID_FIELDS_LIQUID = ("buy_avg", "sell_avg", "latest_buy1", "latest_sell1")
-HYBRID_FIELDS_THIN = ("sell_avg", "buy_avg", "latest_sell1", "latest_buy1")
+# hybrid 两套取值顺序（第一个非零字段生效；当前无值就往前退到历史窗口）
+HYBRID_FIELDS_LIQUID = ("buy_avg", "buy_avg_24h", "sell_avg", "sell_avg_24h",
+                        "latest_buy1", "latest_sell1")
+HYBRID_FIELDS_THIN = ("sell_avg", "sell_avg_24h", "sell_avg_yesterday",
+                      "buy_avg", "buy_avg_24h", "latest_sell1", "latest_buy1")
+
+# 「碎片 → 成品」的合成关系：碎片价值不应低于「成品价 ÷ 份数」
+# （低于这个价，合成套利会把价拉回去；成品价同样按 hybrid 顺序取）。
+# 格式：{碎片英文名（过滤器 BaseType）: (成品英文名, 份数)}
+CRAFT_RATIOS = {
+    "Simulacrum Splinter": ("Simulacrum", 300),
+    "Breach Splinter": ("Breachstone", 300),
+}
 
 # 末尾附「兑换比例」的名称（C/D/E 全变种 + 点金/机会/瓦尔 + 蜕变/增幅 + 发辫 + 镜子）
 BENCHMARK_NAMES = [
@@ -505,6 +515,22 @@ def hybrid_price_fields(item, volumes, floors, anchors, base_fields):
     if sv is None:
         return base_fields
     return HYBRID_FIELDS_LIQUID if sv >= floor else HYBRID_FIELDS_THIN
+
+
+def craft_derived_value(game, name, cn_prices, anchors, volumes, floors, price_fields):
+    """按合成关系算出碎片的「成品价 ÷ 份数」下限；无规则或拿不到成品价时返回 None。"""
+    rule = CRAFT_RATIOS.get(name)
+    if not rule:
+        return None
+    parent_name, ratio = rule
+    parent = cn_prices.get(normalize_name(parent_name))
+    if parent is None or not ratio:
+        return None
+    parent_fields = hybrid_price_fields(parent, volumes, floors, anchors, price_fields)
+    parent_value = cn_value_in_chaos(game, parent, anchors, parent_fields)
+    if not parent_value:
+        return None
+    return parent_value / ratio
 
 
 def compute_floors(cn_prices, anchor_tiers, game, anchors, price_fields):
@@ -920,6 +946,7 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
     total_removed = 0
     n_liquid = 0
     n_thin = 0
+    n_craft = 0
     removed_rows = []
     unreliable_rows = []
     section_summary = []
@@ -963,7 +990,14 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
                     n_liquid += 1
                 elif fields is HYBRID_FIELDS_THIN:
                     n_thin += 1
-                if bt not in ANCHOR_NAMES and not price_is_reliable(item):
+                # 合成兜底：碎片价值 = max(自身价, 成品价 ÷ 份数)
+                craft_value = craft_derived_value(
+                    game, bt, cn_prices, anchors, volumes, floors, price_fields
+                )
+                if craft_value is not None:
+                    n_craft += 1
+                    cn_value = craft_value if cn_value is None else max(cn_value, craft_value)
+                if bt not in ANCHOR_NAMES and not price_is_reliable(item) and craft_value is None:
                     # 价格不可信（只有单边挂单、历史窗口也查不到双边）：
                     # 基础档与源文件里的堆叠规则都原样保留（不重分级、也不重建）
                     base = old_rec["base"]
@@ -1055,6 +1089,8 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
             f"[hybrid] 按求购侧价值（阈值 = {HYBRID_VOLUME_TIER} 档下限）取值："
             f"有量 → buy_avg 优先 {n_liquid} 个；无量 → sell_avg 优先 {n_thin} 个"
         )
+    if n_craft:
+        print(f"[合成兜底] {n_craft} 个碎片按「成品价 ÷ 份数」兜底（取自身价与合成价较高者）")
 
     return new_assignments, total_items, total_changed
 
