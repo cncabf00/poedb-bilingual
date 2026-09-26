@@ -115,6 +115,21 @@ HISTORY_SIDE_FIELDS = (
     ("buy_avg_yesterday", "sell_avg_yesterday"),
 )
 
+# hybrid 取值（按挂单量决定用哪一侧的价格）：
+#   国服接口的 buy / sell 是「从玩家视角」命名的——
+#     buy_avg  = 你要买入的价（对应游戏里的「出售挂单」，通常价高、挂单量小）
+#     sell_avg = 你能卖到的价（对应游戏里的「求购单」，价低、往往有量）
+#   所以：有真金白银在收的道具，挂 buy_avg 也卖得掉；没人收的，只有 sell_avg 能立刻成交。
+# 流动性指标 = 求购侧价值（sell1~5_vol 求和；已用数据校验：sell*_vol 是「价值数」= 件数 × 单价，
+# 而 buy*_vol 更像「件数」，两侧口径不一致，所以只用求购侧）。
+# 求购价值（折算混沌）≥ 该档下限 → buy_avg 优先；否则 sell_avg 优先。
+# 阈值档位可改（默认 S：求购总额够得上 S 档门槛就算有量）；设 None 关闭 hybrid。
+HYBRID_VOLUME_TIER = "S"
+
+# hybrid 两套取值顺序（第一个非零字段生效）
+HYBRID_FIELDS_LIQUID = ("buy_avg", "sell_avg", "latest_buy1", "latest_sell1")
+HYBRID_FIELDS_THIN = ("sell_avg", "buy_avg", "latest_sell1", "latest_buy1")
+
 # 末尾附「兑换比例」的名称（C/D/E 全变种 + 点金/机会/瓦尔 + 蜕变/增幅 + 发辫 + 镜子）
 BENCHMARK_NAMES = [
     "Chaos Orb", "Greater Chaos Orb", "Perfect Chaos Orb",
@@ -224,6 +239,43 @@ def normalize_name(name):
     if not name:
         return ""
     return name.replace("'", "").replace("\u2019", "").lower()
+
+
+def fetch_cn_volumes(game, token=None):
+    """拉国服各道具的最新挂单量（/api/db/price 每小时的 buy1~5_vol / sell1~5_vol）。
+
+    返回 {归一化英文名: {"sell_value": 求购侧价值, "buy_units": 买侧件数}}；失败返回 {}。
+
+    口径注意（已用数据校验）：sell*_vol 是「价值数」（= 件数 × 单价，单位随 currency_unit），
+    而 buy*_vol 更像「件数」——两侧口径不一致，所以 hybrid 只用求购侧价值当流动性指标。
+    无 token 时该接口只允许查最近 24 小时，这里取 2 小时（覆盖最近一条即可）。
+    """
+    version = "1" if game == "poe1" else "2"
+    url = f"{API_BASE}/api/db/price?version={version}&hours=2&limit=10000&order=DESC"
+    try:
+        rows = http_get_json(url, timeout=60)
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] 拉挂单量失败（{e}），hybrid 退回单一取值顺序")
+        return {}
+    if not isinstance(rows, list):
+        return {}
+    latest = {}
+    for r in rows:
+        nm = r.get("item_name")
+        if not nm:
+            continue
+        if nm not in latest or (r.get("datetime") or "") > (latest[nm].get("datetime") or ""):
+            latest[nm] = r
+    out = {}
+    for r in latest.values():
+        key = normalize_name(r.get("engname") or "")
+        if not key:
+            continue
+        out[key] = {
+            "sell_value": sum((r.get(f"sell{i}_vol") or 0) for i in range(1, 6)),
+            "buy_units": sum((r.get(f"buy{i}_vol") or 0) for i in range(1, 6)),
+        }
+    return out
 
 
 def _dispw(s):
@@ -421,6 +473,38 @@ def price_is_reliable(item):
         if item.get(buy_field) and item.get(sell_field):
             return True
     return False
+
+
+def _value_in_chaos(raw, unit, anchors):
+    """把某个「价值数」按计价单位折算成混沌（与 cn_value_in_chaos 的换算规则一致）。"""
+    if raw is None:
+        return None
+    if unit == "d":
+        return raw * anchors["divine_in_chaos"]
+    if unit == anchors["base_unit"]:
+        return raw * anchors["base_in_chaos"]
+    return None
+
+
+def hybrid_price_fields(item, volumes, floors, anchors, base_fields):
+    """按 hybrid 规则给出该道具的取值字段顺序（挂单量不够 → sell_avg 优先）。
+
+    判定：求购侧价值（折算混沌）≥ 阈值档下限（HYBRID_VOLUME_TIER）→ 有量 → buy_avg 优先；
+    否则 → sell_avg 优先。任何一步拿不到数据（无挂单量 / 无下限 / 无该道具）
+    都退回 base_fields（= 命令行给的顺序）。
+    """
+    if not volumes or not floors or HYBRID_VOLUME_TIER is None or item is None:
+        return base_fields
+    floor = floors.get(HYBRID_VOLUME_TIER)
+    if floor is None:
+        return base_fields
+    vol = volumes.get(normalize_name(item.get("engname") or ""))
+    if not vol:
+        return base_fields
+    sv = _value_in_chaos(vol.get("sell_value"), item.get("currency_unit"), anchors)
+    if sv is None:
+        return base_fields
+    return HYBRID_FIELDS_LIQUID if sv >= floor else HYBRID_FIELDS_THIN
 
 
 def compute_floors(cn_prices, anchor_tiers, game, anchors, price_fields):
@@ -820,18 +904,22 @@ def make_output_path(filter_path, explicit_output):
     return p.with_name("[CN]" + p.name)
 
 
-def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_items, verbose):
+def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_items, verbose,
+            volumes=None):
     """重新分级（锚定标志通货法），返回 (new_assignments, total_items, total_changed)。
 
     只删除「黑名单」（配置里 REMOVE_ITEMS）列出的道具（国服确实没有的，防加载失败）；
     其余（含国服查不到价的道具）都保留原档。
     价格不可信（单边挂单且历史窗口也没有双边，见 price_is_reliable）的道具：
     基础档与堆叠规则都原样保留，不参与重分级、也不重建规则。
+    取值顺序按 hybrid 规则逐道具决定（见 hybrid_price_fields）。
     """
     new_assignments = {}
     total_items = 0
     total_changed = 0
     total_removed = 0
+    n_liquid = 0
+    n_thin = 0
     removed_rows = []
     unreliable_rows = []
     section_summary = []
@@ -869,7 +957,12 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
             for bt, old_rec in grp["currencies"].items():
                 n_items += 1
                 item = cn_prices.get(normalize_name(bt))
-                cn_value = cn_value_in_chaos(game, item, anchors, price_fields)
+                fields = hybrid_price_fields(item, volumes, floors, anchors, price_fields)
+                cn_value = cn_value_in_chaos(game, item, anchors, fields)
+                if fields is HYBRID_FIELDS_LIQUID:
+                    n_liquid += 1
+                elif fields is HYBRID_FIELDS_THIN:
+                    n_thin += 1
                 if bt not in ANCHOR_NAMES and not price_is_reliable(item):
                     # 价格不可信（只有单边挂单、历史窗口也查不到双边）：
                     # 基础档与源文件里的堆叠规则都原样保留（不重分级、也不重建）
@@ -957,6 +1050,11 @@ def re_tier(parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_
         f"{total_items - total_changed} 个不变，删除 {total_removed} 个黑名单道具，"
         f"{len(unreliable_rows)} 个因价格不可信（仅单边挂单）保留原档与原堆叠规则"
     )
+    if n_liquid or n_thin:
+        print(
+            f"[hybrid] 按求购侧价值（阈值 = {HYBRID_VOLUME_TIER} 档下限）取值："
+            f"有量 → buy_avg 优先 {n_liquid} 个；无量 → sell_avg 优先 {n_thin} 个"
+        )
 
     return new_assignments, total_items, total_changed
 
@@ -1025,7 +1123,8 @@ def collect_base_names(files):
     return names
 
 
-def process_one(filter_path, game, args, cn_prices, intl_prices, anchors, price_fields, remove_items):
+def process_one(filter_path, game, args, cn_prices, intl_prices, anchors, price_fields, remove_items,
+                volumes=None):
     """处理单个过滤器文件（识别格式 → 解析 → 重分级 → 生成 → 写回）。"""
     print(f"\n--- 处理: {filter_path.name} ---")
 
@@ -1069,6 +1168,7 @@ def process_one(filter_path, game, args, cn_prices, intl_prices, anchors, price_
     # 相对判定重新分级（只删除黑名单道具）
     new_assignments, _, _ = re_tier(
         parsed, cn_prices, intl_prices, game, anchors, price_fields, remove_items, args.verbose,
+        volumes=volumes,
     )
 
     # 按格式重新生成并写回
@@ -1141,6 +1241,9 @@ def main(argv=None):
         try:
             cn_prices = fetch_prices(game, token)
             anchors = compute_anchors(game, cn_prices, price_fields)
+            volumes = fetch_cn_volumes(game, token)
+            if volumes:
+                print(f"[hybrid] 拉到 {len(volumes)} 个道具的挂单量（阈值档位：{HYBRID_VOLUME_TIER or '关闭'}）")
         except Exception as e:  # noqa: BLE001
             print(f"[错误] {game} 抓取国服价失败：{e}，跳过")
             continue
@@ -1204,7 +1307,8 @@ def main(argv=None):
             intl_prices = intl_by_fmt[fmt]
             for fp in files:
                 try:
-                    process_one(fp, game, args, cn_prices, intl_prices, anchors, price_fields, remove_items)
+                    process_one(fp, game, args, cn_prices, intl_prices, anchors, price_fields, remove_items,
+                                volumes=volumes)
                 except Exception as e:  # noqa: BLE001
                     print(f"  [错误] 处理 {fp.name} 失败：{e}")
 
