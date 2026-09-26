@@ -147,15 +147,48 @@ CRAFT_RATIOS = {
         },
     },
     "poe1": {
+        # —— 成品在国服价格数据里，规则会生效 ——
+        "Simulacrum Splinter": {"parent": "Simulacrum", "count": 300},
         "Crescent Splinter": {
             "parent": "The Maven's Writ", "count": 10,
             "note": "游戏内描述：10 个合成 1 个 The Maven's Writ",
         },
-        # 待主人确认份数后启用（经济性推算 ≤126，一代惯例 100）：
-        # "Ritual Splinter": {"parent": "Ritual Vessel", "count": 100,
-        #                     "note": "份数待确认"},
-        # 一代另有 Splinter of Xoph/Tul/Esh/Uul-Netol/Chayula 系列（100 → 对应裂隙之石），
-        # 名字形态为 "Splinter of X" 而非 "X Splinter"，且当前国服价格数据里没有，待确认。
+        "Ritual Splinter": {
+            "parent": "Ritual Vessel", "count": 100,
+            "note": "份数待确认（经济性推算 ≤126，按一代惯例填 100）",
+        },
+        "Timeless Karui Splinter": {"parent": "Timeless Karui Emblem", "count": 100},
+        "Timeless Maraketh Splinter": {"parent": "Timeless Maraketh Emblem", "count": 100},
+        "Timeless Templar Splinter": {"parent": "Timeless Templar Emblem", "count": 100},
+        "Timeless Vaal Splinter": {
+            "parent": "Timeless Vaal Emblem", "count": 100,
+            "note": "名字由 X Emblem 类推，待用过滤器核对",
+        },
+        "Timeless Eternal Empire Splinter": {
+            "parent": "Timeless Eternal Emblem", "count": 100,
+            "note": "名字由 X Emblem 类推，待用过滤器核对",
+        },
+        # —— 已配置，但国服价格数据里暂无对应成品，待数据出现自动生效 ——
+        "Splinter of Xoph": {
+            "parent": "Xoph's Breachstone", "count": 100,
+            "note": "100 个合成索伏裂隙之石；国服数据暂无成品价",
+        },
+        "Splinter of Tul": {
+            "parent": "Tul's Breachstone", "count": 100,
+            "note": "国服数据暂无成品价",
+        },
+        "Splinter of Esh": {
+            "parent": "Esh's Breachstone", "count": 100,
+            "note": "国服数据暂无成品价",
+        },
+        "Splinter of Uul-Netol": {
+            "parent": "Uul-Netol's Breachstone", "count": 100,
+            "note": "国服数据暂无成品价",
+        },
+        "Splinter of Chayula": {
+            "parent": "Chayula's Breachstone", "count": 100,
+            "note": "国服数据暂无成品价",
+        },
     },
 }
 
@@ -569,9 +602,10 @@ def validate_craft_ratios(game, cn_prices):
             print(f"[WARN] 合成兜底表（{game}）{name}：缺 parent 或 count，已跳过")
             continue
         if cn_prices.get(normalize_name(name)) is None:
-            print(f"[WARN] 合成兜底表（{game}）{name}：国服价格数据里找不到这个碎片，条目暂不生效")
+            print(f"[提示] 合成兜底表（{game}）{name}：国服价格数据里没有碎片自身价，"
+                  f"合成价仍会生效（只取「成品价 ÷ count」）")
         if cn_prices.get(normalize_name(parent)) is None:
-            print(f"[WARN] 合成兜底表（{game}）{name}：找不到成品「{parent}」，条目暂不生效")
+            print(f"[WARN] 合成兜底表（{game}）{name}：找不到成品「{parent}」，条目不生效")
 
 
 def compute_floors(cn_prices, anchor_tiers, game, anchors, price_fields):
