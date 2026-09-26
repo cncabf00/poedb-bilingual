@@ -155,40 +155,19 @@ CRAFT_RATIOS = {
         },
         "Ritual Splinter": {
             "parent": "Ritual Vessel", "count": 100,
-            "note": "份数待确认（经济性推算 ≤126，按一代惯例填 100）",
+            "note": "编年史：用 100 个裂片创造一个驱灵法器",
         },
         "Timeless Karui Splinter": {"parent": "Timeless Karui Emblem", "count": 100},
         "Timeless Maraketh Splinter": {"parent": "Timeless Maraketh Emblem", "count": 100},
         "Timeless Templar Splinter": {"parent": "Timeless Templar Emblem", "count": 100},
-        "Timeless Vaal Splinter": {
-            "parent": "Timeless Vaal Emblem", "count": 100,
-            "note": "名字由 X Emblem 类推，待用过滤器核对",
-        },
+        "Timeless Vaal Splinter": {"parent": "Timeless Vaal Emblem", "count": 100,
+                                  "note": "名字已核对"},
         "Timeless Eternal Empire Splinter": {
             "parent": "Timeless Eternal Emblem", "count": 100,
-            "note": "名字由 X Emblem 类推，待用过滤器核对",
+            "note": "名字已核对",
         },
-        # —— 已配置，但国服价格数据里暂无对应成品，待数据出现自动生效 ——
-        "Splinter of Xoph": {
-            "parent": "Xoph's Breachstone", "count": 100,
-            "note": "100 个合成索伏裂隙之石；国服数据暂无成品价",
-        },
-        "Splinter of Tul": {
-            "parent": "Tul's Breachstone", "count": 100,
-            "note": "国服数据暂无成品价",
-        },
-        "Splinter of Esh": {
-            "parent": "Esh's Breachstone", "count": 100,
-            "note": "国服数据暂无成品价",
-        },
-        "Splinter of Uul-Netol": {
-            "parent": "Uul-Netol's Breachstone", "count": 100,
-            "note": "国服数据暂无成品价",
-        },
-        "Splinter of Chayula": {
-            "parent": "Chayula's Breachstone", "count": 100,
-            "note": "国服数据暂无成品价",
-        },
+        # 注：Splinter of Xoph / Tul / Esh / Uul-Netol / Chayula 为旧版本内容，
+        #     当前已不存在，不入表。
     },
 }
 
