@@ -3,3 +3,11 @@ poe2filter-cn-tier-config.py
 
 # 国际服物价备份表（本地生成的快照，会变化，不要提交）
 intl-*.json
+
+# 市场报表：产物与行情缓存（本地生成，随日期增长，不要提交）
+reports/
+cache/
+
+# Python 运行产物
+__pycache__/
+*.pyc
