@@ -322,11 +322,17 @@ def build(args):
         rr = [r["r24"] for r in rs if r["r24"] is not None and r["p"]]
         cat_stat.append({"cat": c, "n": len(rs), "avg": (sum(rr) / len(rr)) if rr else None})
 
-    # ---------- 刷子：在涨 / 在跌 ----------
-    liquid = [r for r in rows if r["v"] and r["p"]]
-    up = sorted([r for r in liquid if r["r24"] and r["r24"] > 0], key=lambda r: -r["r24"])[:6]
-    down = sorted([r for r in liquid if r["r24"] and r["r24"] < 0 and r["p"] >= 5],
-                  key=lambda r: r["r24"])[:6]
+    # ---------- 刷图：关注 / 回避 ----------
+    # 关注门槛：价格 ≥ 1D 或 求购资金 ≥ 100D
+    # （避免小额货刷屏；也避免「包圆整个市场也没多少」的标的）
+    min_price, min_vol = 1.0 * cpd, 100.0 * cpd
+    sig = [r for r in rows if r["p"] and r["v"]
+           and (r["p"] >= min_price or r["v"] >= min_vol)]
+    up = sorted([r for r in sig if r["r24"] and r["r24"] > 0], key=lambda r: -r["r24"])[:6]
+    # 回避看长线（多日），短周期波动不作数
+    long_ok = hlabel is not None
+    down = sorted([r for r in sig if r["rh"] is not None and r["rh"] <= -20],
+                  key=lambda r: r["rh"])[:6]
 
     # ---------- 做装 ----------
     craft = []
@@ -337,9 +343,13 @@ def build(args):
 
     # ---------- 保值 ----------
     def keep_score(r):
-        if not (r["p"] and r["v"]) or r["r24"] is None:
+        if not (r["p"] and r["v"]):
             return None
-        steady = 1.0 / (1.0 + abs(r["r24"]) / 8.0)
+        # 有长线数据就用长线（对长期持有更有意义）
+        move = r["rh"] if r["rh"] is not None else r["r24"]
+        if move is None:
+            return None
+        steady = 1.0 / (1.0 + abs(move) / (20.0 if r["rh"] is not None else 8.0))
         money = min(1.0, math.log10(r["v"] + 1) / 3.5)
         scale = min(1.0, math.log10(r["p"] + 1) / 4.0)
         return steady * money * scale
@@ -406,24 +416,28 @@ def build(args):
 
     spot = []
     if up:
-        spot.append(f'气氛最热：<b>{esc(up[0]["cn"])}</b> '
+        spot.append(f'涨幅居前：<b>{esc(up[0]["cn"])}</b> '
                     f'<span class="up">▲{up[0]["r24"]:.1f}%</span> → {fnum(up[0]["p"])}')
     if down:
-        spot.append(f'跌得最狠：<b>{esc(down[0]["cn"])}</b> '
-                    f'<span class="down">▼{abs(down[0]["r24"]):.1f}%</span> → {fnum(down[0]["p"])}')
+        spot.append(f'长线跌幅居前：<b>{esc(down[0]["cn"])}</b> '
+                    f'<span class="down">▼{abs(down[0]["rh"]):.1f}%</span>（{hlabel}）→ {fnum(down[0]["p"])}')
+    elif not long_ok:
+        spot.append('长线（多日）判定暂缺：本地缓存仅 1 天，需每日运行积累')
     if keep:
-        spot.append(f'最稳的资产：<b>{esc(keep[0]["cn"])}</b> {fnum(keep[0]["p"])}'
-                    f'（24h {keep[0]["r24"]:+.1f}%，求购 {fnum(keep[0]["v"])}）')
+        spot.append(f'波动最小的资产：<b>{esc(keep[0]["cn"])}</b> {fnum(keep[0]["p"])}'
+                    f'（求购资金 {fnum(keep[0]["v"])}）')
     if bad:
-        spot.append(f'最坑的挂单：<b>{esc(bad[0]["cn"])}</b> 价差 '
-                    f'{spread(bad[0]):.0f}×（挂高价基本卖不掉）')
+        spot.append(f'价差异常：<b>{esc(bad[0]["cn"])}</b> '
+                    f'{spread(bad[0]):.0f}×（挂高价难以成交）')
     if arb:
         a = max(arb, key=lambda x: (x["der"] / x["own"]) if x["own"] else 99)
         spot.append(f'合成划算：<b>{esc(a["cn"])}</b> 自身 {fnum(a["own"])} ＜ 合成价 {fnum(a["der"])}')
 
     def r_rows(rs):
-        vmax = max((x["v"] or 0) for x in rs) or 1
         heads = ["道具", "价", "24h"] + ([hlabel] if hlabel else []) + ["求购资金"]
+        if not rs:
+            return heads, []
+        vmax = max((x["v"] or 0) for x in rs) or 1
         body = [[f'<b>{esc(r["cn"])}</b><br><span class="tag">{esc(r["cat"])}</span>',
                  fnum(r["p"]), delta(r["r24"])]
                 + ([delta(r["rh"])] if hlabel else [])
@@ -433,19 +447,26 @@ def build(args):
     h_up, b_up = r_rows(up)
     h_dn, b_dn = r_rows(down)
     cmax = max((abs(c["avg"]) for c in cat_stat if c["avg"]), default=1)
-    cat_bars = []
+    cat_rows = []
     for c in sorted([x for x in cat_stat if x["avg"] is not None], key=lambda x: -x["avg"])[:10]:
-        w = abs(c["avg"]) / cmax
-        cat_bars.append(
-            f'<tr><td>{esc(c["cat"])} <span class="dim">({c["n"]})</span></td>'
-            f'<td class="{"up" if c["avg"]>=0 else "down"}">{c["avg"]:+.1f}%</td>'
-            f'<td style="width:45%">{bar(w, "up" if c["avg"] >= 0 else "down")}</td></tr>')
+        cls = "up" if c["avg"] >= 0 else "down"
+        cat_rows.append([f'{esc(c["cat"])} <span class="dim">({c["n"]})</span>',
+                         f'<span class="{cls}">{c["avg"]:+.1f}%</span>',
+                         bar(abs(c["avg"]) / cmax, cls)])
 
+    if long_ok:
+        avoid_sub = f"价格 ≥ 1D 且 {hlabel} 跌幅 ≥ 20%"
+        avoid_body = (table(h_dn, b_dn) if b_dn
+                      else '<p class="hint">本期没有满足条件的标的</p>')
+    else:
+        avoid_sub = "待数据积累"
+        avoid_body = ('<p class="hint">长线下跌需要多日数据判定（当前本地缓存仅 1 天）。'
+                      '短周期（24h）波动不作为回避依据，建议先每日运行积累缓存。</p>')
     farm = (f'<div class="grid">'
-            f'{panel("🔥 值得关注（在涨 + 卖得掉）", "按 24h 涨幅", table(h_up, b_up))}'
-            f'{panel("⚠️ 建议避开（曾经值钱、在跌）", "价格 ≥ 5C 且 24h 跌幅大", table(h_dn, b_dn))}'
+            f'{panel("关注名单（上涨 + 有量）", "门槛：价格 ≥ 1D 或 求购资金 ≥ 100D；按 24h 涨幅排序", table(h_up, b_up))}'
+            f'{panel("回避名单（长线下跌）", avoid_sub, avoid_body)}'
             f'</div><div style="margin-top:18px">'
-            f'{panel("各玩法冷热", "类目内 24h 平均涨跌", table(["类目", "均值", ""], cat_bars))}'
+            f'{panel("各类目涨跌", "类目内 24h 平均涨跌", table(["类目", "均值", ""], cat_rows))}'
             f'</div>')
 
     ccards = []
@@ -470,13 +491,13 @@ def build(args):
     k_rows = [[f'<b>{esc(r["cn"])}</b>', fnum(r["p"]), delta(r["r24"])]
               + ([delta(r["rh"])] if hlabel else [])
               + [fnum(r["v"]), f'{r["score"]*100:.0f}'] for r in keep]
-    wealth = panel("抗跌 + 好变现 + 有量级", "保值分 = 稳定性 × 求购资金 × 价格量级",
+    wealth = panel("抗跌 · 变现 · 量级", "保值分 = 稳定性 × 求购资金 × 价格量级（有长线数据则用长线波动）",
                    table(k_heads, k_rows))
 
     b_rows = [[f'<b>{esc(r["cn"])}</b>', fnum(r["p"]), fnum(r["s"]),
                f'{spread(r):.1f}×', fnum(r["v"]) if r["v"] else '<span class="down">薄</span>']
               for r in bad[:8]]
-    avoid = panel("挂高价可能长期卖不掉", "价差 = 出售挂单价 ÷ 求购价",
+    avoid = panel("买卖价差异常", "价差 = 出售挂单价 ÷ 求购价；价差越大越难成交",
                   table(["道具", "出售挂单价", "求购价", "价差", "求购资金"], b_rows))
 
     intl_html = ""
@@ -499,18 +520,18 @@ def build(args):
 
 <div class="kpis">{"".join(kpis)}</div>
 
-<section><h2><span class="ico">📌</span>今日要点</h2>
+<section><h2><span class="ico">📌</span>行情摘要</h2>
 <ul class="bullets">{"".join(f"<li>{x}</li>" for x in spot)}</ul></section>
 
-{section("⛏️", "刷子视角", "我在刷图", "看两件事：哪类玩法在涨（值得刷）、哪些东西曾经值钱但现在在跌（避开）", farm)}
+{section("⛏️", "刷图收益", "Farm", "关注有量且上涨的标的；回避长线下跌的标的", farm)}
 
-{section("🔨", "做装视角", "我在做装备", "做装耗材按玩法分类，每类只看最贵的三个", craft_html)}
+{section("🔨", "制作材料", "Crafting", "做装耗材按玩法类目分组，每类只列价格最高的三项", craft_html)}
 
-{section("🏦", "保值视角", "我在存钱", "没有基准货币，所以用三件事衡量：抗跌（24h 稳）、好变现（求购资金厚）、有量级（价格够高）", wealth)}
+{section("🏦", "资产保值", "Wealth", "无统一基准货币，故以三项衡量：抗跌（多日波动小）、变现力（求购资金厚）、价值量级", wealth)}
 
-{section("🚫", "避坑清单", "别踩", "买卖价差过大的道具：挂高价可能长期无人接", avoid)}
+{section("🚫", "风险提示", "Risk", "买卖价差过大的标的：挂高价难以成交", avoid)}
 
-{section("🌍", "国服 vs 国际服", "交叉参考", "仅供参照，不参与过滤器档位判定", intl_html) if intl_html else ""}
+{section("🌍", "国服与国际服", "Reference", "仅供交叉参考，不参与过滤器档位判定", intl_html) if intl_html else ""}
 
 <footer>
 口径：<code>buy_avg</code> = 你要买入的价（游戏内「出售挂单」侧）；<code>sell_avg</code> = 你能卖到的价（「求购单」侧）；
