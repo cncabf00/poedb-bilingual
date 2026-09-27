@@ -41,6 +41,36 @@ LUX_MIN_DIVINE = 20.0
 # 长线下跌判定门槛（多日跌幅，%）
 DECLINE_PCT = -20.0
 
+# 只保留两侧都有价的标的（单边挂单 = 市场不成立/道具不存在，如「奥杜尔之传说」）
+REQUIRE_TWO_SIDED = True
+# 例外：确实存在但天然单边的（白名单，按中文名）
+ONE_SIDED_WHITELIST = {"梦魇拟像裂片", "裂隙碎片"}
+
+# ============================== 玩法归类 ==============================
+# 接口的 category_label 是「仓库分类」，不完全等于玩法；这里归一到玩法。
+# 一个类目只归一个玩法；个别道具用 ITEM_OVERRIDE 单独指派（按中文名）。
+# 未列出的类目落到「待归类」。主人可自行增删。
+STRATEGY_MAP = {
+    "全局掉落": ["通货仓库", "精华", "符文"],
+    "迷雾": ["液化情感", "渡鸦之触"],
+    "先祖密藏": ["合金通货", "先驱徽记", "溶剂", "秘术溶剂", "血脉辅助宝石"],
+    "深渊": ["凝视", "深渊通货"],
+    "裂隙": ["催化剂"],
+    "祭祀": ["预兆"],
+    "神庙": ["神庙通货", "圣典", "灵核"],
+    "碎片与首领": ["地图碎片"],
+    "待归类": ["星辉矿石", "雕像"],
+}
+
+# 个别道具的玩法修正（覆盖上面的类目归类）
+ITEM_OVERRIDE = {
+    "变形锁骨": "裂隙",          # 主人指出：实际是裂隙产出
+    "梦魇拟像": "迷雾",
+    "梦魇拟像裂片": "迷雾",
+    "裂隙石": "裂隙",
+    "裂隙碎片": "裂隙",
+}
+
 
 def load_tier_tool():
     spec = importlib.util.spec_from_file_location("tier_tool", HERE / "poe2filter-cn-tier.py")
@@ -96,8 +126,18 @@ def load_day(game, token, cache_dir, refresh=False):
     if p.exists() and not refresh:
         try:
             d = json.loads(p.read_text(encoding="utf-8"))
-            print(f"[cache] 命中当天缓存 {p.name}")
-            return d.get("items") or {}, d.get("volumes") or {}, {"day": today, "cached": True}
+            items_c, vols_c = d.get("items") or {}, d.get("volumes") or {}
+            # 挂单量时效性强（接口偶有缺行），命中缓存也重新拉一次；失败再用缓存的
+            try:
+                vols_new = T.fetch_cn_volumes(game, token)
+                if vols_new:
+                    vols_c = vols_new
+                    d["volumes"] = vols_new
+                    p.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+            except Exception as e2:  # noqa: BLE001
+                print(f"[WARN] 挂单量刷新失败（{e2}），沿用缓存")
+            print(f"[cache] 命中当天缓存 {p.name}（挂单量已刷新）")
+            return items_c, vols_c, {"day": today, "cached": True}
         except Exception as e:  # noqa: BLE001
             print(f"[WARN] 当天缓存损坏（{e}），重新拉取")
     items = volumes = None
@@ -308,18 +348,31 @@ def build(args):
     def spread(r):
         return (r["p"] / r["s"]) if (r["p"] and r["s"]) else None
 
-    # ---------- 策略清单：按玩法类目 ----------
-    cats = defaultdict(list)
+    # ---------- 玩法归类 + 策略清单 ----------
+    def gameplay_of(r):
+        if r["cn"] in ITEM_OVERRIDE:
+            return ITEM_OVERRIDE[r["cn"]]
+        for gp, cs in STRATEGY_MAP.items():
+            if r["cat"] in cs:
+                return gp
+        return "待归类"
+
+    def tradable(r):
+        """两侧都有价才算真实标的（单边 = 市场不成立）；白名单豁免。"""
+        if not REQUIRE_TWO_SIDED or r["cn"] in ONE_SIDED_WHITELIST:
+            return True
+        return bool(r["p"] and r["s"])
+
+    gps = defaultdict(list)
     for r in rows:
-        cats[r["cat"]].append(r)
+        if r["p"] and tradable(r):
+            gps[gameplay_of(r)].append(r)
     strat = []
-    for c, rs0 in cats.items():
-        rs = [r for r in rs0 if r["p"]]
-        if not rs:
-            continue
-        strat.append({"cat": c, "n": len(rs),
+    for gp, rs in gps.items():
+        # 每类按「求购资金」降序（只看价格的会埋掉高流动性标的，如左旋消抹预兆）
+        strat.append({"cat": gp, "n": len(rs),
                       "tv": sum((r["v"] or 0) for r in rs),
-                      "top": sorted(rs, key=lambda r: -r["p"])[:5]})
+                      "top": sorted(rs, key=lambda r: -(r["v"] or 0))[:12]})
     strat.sort(key=lambda x: -x["tv"])
 
     # ---------- 高价值资产（稳定高价 / 奢侈品） ----------
@@ -379,7 +432,7 @@ def build(args):
         src_note += " ⚠️ 在线失败，已回退缓存"
     net_note = (f"长线列为 {hlabel}" if hlabel else "长线列待积累（本地缓存仅今天，需每日运行）")
 
-    def item_table(rs, n=6):
+    def item_table(rs, n=12):
         heads = ["标的", "价", hlabel or "24h", "求购资金"]
         body = [[f'<b>{esc(r["cn"])}</b>', fnum(r["p"]), delta(move_of(r)),
                  fnum(r["v"]) if r["v"] else '<span class="down">薄</span>'] for r in rs[:n]]
@@ -412,7 +465,7 @@ def build(args):
     cards = []
     for s in strat:
         cards.append(panel(f'{s["cat"]}', f'{s["n"]} 项 ｜ 体量 {fnum(s["tv"])}',
-                           item_table(s["top"], 5)))
+                           item_table(s["top"], 12)))
     strategy_html = f'<div class="grid3">{"".join(cards)}</div>'
 
     lux_html = item_table(lux, 10) if lux else '<p class="hint">本期没有满足条件的标的</p>'
@@ -444,7 +497,9 @@ def build(args):
 <ul class="bullets">{"".join(f"<li>{x}</li>" for x in spot)}</ul></section>
 
 {section("📋", "策略清单（按玩法）", "Farm",
-         "哪类玩法资金量大（值得投入）、每类最值钱的产出是什么。按市场体量排序",
+         "已按玩法归一（迷雾 / 先祖密藏 / 深渊 / 裂隙 / 祭祀 / 神庙 / 全局掉落…）；"
+         "每类按求购资金降序列出前 12 项（只看价格会埋掉高流动性标的）。"
+         "单边挂单的标的（市场不成立）已排除",
          strategy_html)}
 
 {section("💎", "高价值资产", "Wealth",
