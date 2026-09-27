@@ -1,24 +1,21 @@
 #!/usr/bin/env python3
-"""POE2 国服市场日报（v3 · 按玩家视角组织 + 按日缓存 + 多日回看）。
+"""POE2 国服市场日报（v5 · 按玩法组织的策略清单）。
 
-设计原则（主人反馈后逐步成型）：
-  1. 先定「我是谁、要干什么」—— 刷子 / 做装 / 保值 三个视角
-  2. 一屏一类，每类只给 Top 3~8，不铺全量
-  3. 数字说人话：智能单位（D/C/E）+ 两位有效数字 + 涨跌箭头
-  4. 卡片化 + 条形图，像 PPT 而不是数据库导出
-  5. 工程约定：产物进 reports/，行情按日缓存进 cache/（都不进 git）
+设计标准：**每一栏都必须回答一个具体问题**，答不上来的删掉。
 
-缓存与容错：
-  - 每天的原始数据（含锚点）落盘到 cache/<game>/market-YYYY-MM-DD.json
-  - 当天已有缓存则直接复用（--refresh 强制重拉）
-  - 在线失败时自动回退到最近可用的缓存（有啥用啥）
-  - 报表里的「N 日」列基于已积累的缓存天数，有几天算几天
+栏目与它们回答的问题
+  📋 策略清单（按玩法）—— 哪类玩法资金量大（值得投入）？每类最值钱的产出是什么？
+  💎 高价值资产        —— 哪些东西适合长期持有/储值（稳定高价、奢侈品）？
+  📉 长线下跌          —— 哪些东西在贬值、不要囤？（只认多日跌幅，短周期波动不作数）
+  🌍 国服与国际服       —— 两边价差（交叉参考）
 
-用法:
-    python3 poe2-market-report.py                    # → reports/poe2-market-<日期>.html
-    python3 poe2-market-report.py --refresh          # 无视当天缓存重新拉
-    python3 poe2-market-report.py --days 14          # 多日列回看窗口
-    python3 poe2-market-report.py --game poe1
+工程约定
+  - 产物统一进 reports/
+  - 行情按日缓存进 cache/<game>/market-YYYY-MM-DD.json（含锚点），当天复用、--refresh 强拉
+  - 在线失败自动回退最近可用缓存；多日列有几天算几天
+
+用法
+  python3 poe2-market-report.py [--refresh] [--days 7] [--game poe2] [--no-intl]
 """
 import argparse
 import importlib.util
@@ -36,9 +33,13 @@ sys.path.insert(0, str(HERE))
 
 import poe_ninja  # noqa: E402
 
-# 目录约定（都不进 git，见 .gitignore）
 CACHE_DIRNAME = "cache"
 OUT_DIRNAME = "reports"
+
+# 奢侈品/高价资产的判定门槛（以 D 为单位，运行时乘 cpd）
+LUX_MIN_DIVINE = 20.0
+# 长线下跌判定门槛（多日跌幅，%）
+DECLINE_PCT = -20.0
 
 
 def load_tier_tool():
@@ -49,10 +50,6 @@ def load_tier_tool():
 
 
 T = load_tier_tool()
-
-# 做装耗材类目（按接口 category_label 匹配，命中即入「做装」视角）
-CRAFT_CATS = ["精华", "催化剂", "合金通货", "溶剂", "秘术溶剂", "预兆",
-              "符文", "灵核", "星辉矿石", "液化情感"]
 
 
 # ============================== 取数 ==============================
@@ -93,11 +90,7 @@ def cache_file(cache_dir, game, day):
 
 
 def load_day(game, token, cache_dir, refresh=False):
-    """取当天数据：优先当天缓存，未命中才在线拉取并落盘。
-
-    容错：在线失败时回退最近一个可用日期的缓存。
-    返回 (items, volumes, meta)，meta 含 day / cached / stale。
-    """
+    """取当天数据：优先当天缓存，未命中才在线拉取并落盘；失败回退最近缓存。"""
     today = datetime.now().strftime("%Y-%m-%d")
     p = cache_file(cache_dir, game, today)
     if p.exists() and not refresh:
@@ -136,7 +129,7 @@ def load_day(game, token, cache_dir, refresh=False):
 
 
 def load_history(game, cache_dir, days, today):
-    """读最近 N 天的缓存（不含 today），返回 {day: 缓存dict}，按日期升序。"""
+    """读最近 N 天缓存（不含 today），返回 {day: 缓存dict}，按日期升序。"""
     base = Path(cache_dir) / game
     if not base.exists():
         return {}
@@ -154,7 +147,6 @@ def load_history(game, cache_dir, days, today):
 
 
 def hist_price(game, rec, key, anchors_fallback):
-    """从某天缓存取某道具的混沌价（用那天自己的锚点）。"""
     it = (rec.get("items") or {}).get(key)
     if not it:
         return None
@@ -162,10 +154,9 @@ def hist_price(game, rec, key, anchors_fallback):
     return T.cn_value_in_chaos(game, it, a, T.PRICE_FIELDS)
 
 
-# ============================== 数字格式化 ==============================
+# ============================== 展示 ==============================
 
 def make_fmt(cpd, cpe):
-    """智能单位：>=1D 用 D，>=1C 用 C，其余用 E。"""
     def f(v):
         if v is None:
             return "-"
@@ -191,12 +182,10 @@ def esc(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def bar(pct_of_max, kind="up"):
-    w = max(3, min(100, pct_of_max * 100))
+def bar(pct, kind="up"):
+    w = max(3, min(100, pct * 100))
     return f'<div class="bar {kind}"><i style="width:{w:.0f}%"></i></div>'
 
-
-# ============================== HTML 骨架 ==============================
 
 CSS = """
 :root{--bg:#0f1116;--card:#181b23;--card2:#1f2430;--fg:#e8eaf0;--dim:#8f97a8;
@@ -210,7 +199,8 @@ h2{font-size:19px;margin:0 0 4px;display:flex;align-items:center;gap:9px}
 h2 .ico{font-size:20px}
 h2 .who{color:var(--acc);font-size:12px;border:1px solid var(--acc);border-radius:99px;
 padding:1px 9px;font-weight:400}
-.hint{color:var(--dim);font-size:12.5px;margin:0 0 16px}
+.asks{color:var(--fg);background:#1c2130;border-left:3px solid var(--acc);
+padding:7px 14px;border-radius:0 8px 8px 0;font-size:13px;margin:0 0 16px}
 section{background:var(--card);border:1px solid var(--line);border-radius:14px;
 padding:22px 26px;margin-bottom:22px}
 .kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:22px}
@@ -221,23 +211,24 @@ border-radius:14px;padding:16px 20px}
 .kpi .s{color:var(--dim);font-size:12px;margin-top:2px}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
 .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
-.panel{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:14px 18px}
-.panel h3{margin:0 0 10px;font-size:14.5px;font-weight:600}
-.panel h3 small{color:var(--dim);font-weight:400;margin-left:6px}
-table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;font-size:13.5px}
-th{color:var(--dim);font-weight:500;font-size:12px;text-align:right;padding:5px 8px;
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+.panel{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:13px 16px;
+margin-bottom:14px}
+.panel h3{margin:0 0 9px;font-size:14px;font-weight:600;display:flex;
+justify-content:space-between;align-items:baseline;gap:8px}
+.panel h3 em{font-style:normal;color:var(--dim);font-size:11.5px;font-weight:400}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;font-size:13px}
+th{color:var(--dim);font-weight:500;font-size:11.5px;text-align:right;padding:4px 7px;
 border-bottom:1px solid var(--line)}
-td{padding:7px 8px;text-align:right;border-bottom:1px solid #1e2330}
+td{padding:6px 7px;text-align:right;border-bottom:1px solid #1e2330}
 th:first-child,td:first-child{text-align:left}
 tr:last-child td{border-bottom:none}
 .up{color:var(--up)} .down{color:var(--down)} .dim{color:var(--dim)}
-.bar{height:5px;border-radius:3px;background:#2a3140;overflow:hidden;min-width:60px}
+.bar{height:5px;border-radius:3px;background:#2a3140;overflow:hidden;min-width:50px}
 .bar i{display:block;height:100%;background:var(--up)}
 .bar.down i{background:var(--down)}
 .bar.acc i{background:var(--acc)}
-.bullets{margin:0;padding-left:20px}
-.bullets li{margin-bottom:7px}
-.tag{font-size:11px;padding:1px 7px;border-radius:99px;background:#2a3140;color:var(--dim)}
+.bullets{margin:0;padding-left:20px} .bullets li{margin-bottom:6px}
 footer{color:var(--dim);font-size:12px;margin-top:10px;line-height:1.9}
 code{background:#232936;padding:1px 6px;border-radius:5px;font-size:12px}
 """
@@ -249,8 +240,8 @@ def kpi(k, v, s=""):
 
 
 def panel(title, sub, body):
-    s = f"<small>{esc(sub)}</small>" if sub else ""
-    return f'<div class="panel"><h3>{esc(title)}{s}</h3>{body}</div>'
+    e = f"<em>{esc(sub)}</em>" if sub else ""
+    return f'<div class="panel"><h3><span>{esc(title)}</span>{e}</h3>{body}</div>'
 
 
 def table(headers, rows):
@@ -259,13 +250,13 @@ def table(headers, rows):
     return f"<table><thead><tr>{h}</tr></thead><tbody>{b}</tbody></table>"
 
 
-def section(icon, title, who, hint, body):
+def section(icon, title, who, ask, body):
     return (f'<section><h2><span class="ico">{icon}</span>{esc(title)}'
             f'<span class="who">{esc(who)}</span></h2>'
-            f'<p class="hint">{hint}</p>{body}</section>')
+            f'<p class="asks">这栏看什么：{esc(ask)}</p>{body}</section>')
 
 
-# ============================== 报表主体 ==============================
+# ============================== 主流程 ==============================
 
 def build(args):
     game = args.game
@@ -299,7 +290,7 @@ def build(args):
             "r24": it.get("buy_avg_ratio"), "rh": None,
         })
 
-    # ---------- 多日变化（有几天算几天） ----------
+    # 多日变化（有几天算几天）
     if hist_days:
         for r in rows:
             if not r["p"]:
@@ -310,62 +301,44 @@ def build(args):
                     r["rh"] = (r["p"] / hv - 1) * 100
                     break
 
+    def move_of(r):
+        """优先长线，其次 24h。"""
+        return r["rh"] if r["rh"] is not None else r["r24"]
+
     def spread(r):
         return (r["p"] / r["s"]) if (r["p"] and r["s"]) else None
 
-    # ---------- 类目冷热 ----------
+    # ---------- 策略清单：按玩法类目 ----------
     cats = defaultdict(list)
     for r in rows:
         cats[r["cat"]].append(r)
-    cat_stat = []
-    for c, rs in cats.items():
-        rr = [r["r24"] for r in rs if r["r24"] is not None and r["p"]]
-        cat_stat.append({"cat": c, "n": len(rs), "avg": (sum(rr) / len(rr)) if rr else None})
+    strat = []
+    for c, rs0 in cats.items():
+        rs = [r for r in rs0 if r["p"]]
+        if not rs:
+            continue
+        strat.append({"cat": c, "n": len(rs),
+                      "tv": sum((r["v"] or 0) for r in rs),
+                      "top": sorted(rs, key=lambda r: -r["p"])[:5]})
+    strat.sort(key=lambda x: -x["tv"])
 
-    # ---------- 刷图：关注 / 回避 ----------
-    # 关注门槛：价格 ≥ 1D 或 求购资金 ≥ 100D
-    # （避免小额货刷屏；也避免「包圆整个市场也没多少」的标的）
-    min_price, min_vol = 1.0 * cpd, 100.0 * cpd
-    sig = [r for r in rows if r["p"] and r["v"]
-           and (r["p"] >= min_price or r["v"] >= min_vol)]
-    up = sorted([r for r in sig if r["r24"] and r["r24"] > 0], key=lambda r: -r["r24"])[:6]
-    # 回避看长线（多日），短周期波动不作数
-    long_ok = hlabel is not None
-    down = sorted([r for r in sig if r["rh"] is not None and r["rh"] <= -20],
-                  key=lambda r: r["rh"])[:6]
-
-    # ---------- 做装 ----------
-    craft = []
-    for c in CRAFT_CATS:
-        rs = [r for r in cats.get(c, []) if r["p"]]
-        if rs:
-            craft.append((c, sorted(rs, key=lambda r: -r["p"])[:3]))
-
-    # ---------- 保值 ----------
-    def keep_score(r):
-        if not (r["p"] and r["v"]):
-            return None
-        # 有长线数据就用长线（对长期持有更有意义）
-        move = r["rh"] if r["rh"] is not None else r["r24"]
-        if move is None:
-            return None
-        steady = 1.0 / (1.0 + abs(move) / (20.0 if r["rh"] is not None else 8.0))
-        money = min(1.0, math.log10(r["v"] + 1) / 3.5)
-        scale = min(1.0, math.log10(r["p"] + 1) / 4.0)
-        return steady * money * scale
-    keep = []
+    # ---------- 高价值资产（稳定高价 / 奢侈品） ----------
+    lux_min = LUX_MIN_DIVINE * cpd
+    lux = []
     for r in rows:
-        sc = keep_score(r)
-        if sc:
-            keep.append({**r, "score": sc})
-    keep.sort(key=lambda r: -r["score"])
-    keep = keep[:10]
+        if not (r["p"] and r["v"]) or r["p"] < lux_min:
+            continue
+        mv = move_of(r)
+        steady = 1.0 / (1.0 + abs(mv) / 20.0) if mv is not None else 0.5
+        lux.append({**r, "score": r["p"] * steady})
+    lux.sort(key=lambda r: -r["score"])
+    lux = lux[:10]
 
-    # ---------- 避坑 ----------
-    bad = [r for r in rows if spread(r) and spread(r) >= 3 and r["p"] and r["p"] >= 0.5]
-    bad.sort(key=lambda r: -spread(r))
+    # ---------- 长线下跌 ----------
+    decline = sorted([r for r in rows if r["rh"] is not None and r["rh"] <= DECLINE_PCT and r["p"]],
+                     key=lambda r: r["rh"])[:8]
 
-    # ---------- 碎片合成 ----------
+    # ---------- 碎片合成（价值下限参考） ----------
     arb = []
     for child, rule in (T.CRAFT_RATIOS.get(game) or {}).items():
         if not isinstance(rule, dict) or not rule.get("parent") or not rule.get("count"):
@@ -377,8 +350,7 @@ def build(args):
         cv, pv = val(ci), val(pi, "sell_avg") or val(pi)
         if not pv:
             continue
-        arb.append({"cn": ci.get("item_name") or child, "own": cv, "der": pv / rule["count"],
-                    "pc": pi.get("item_name") or rule["parent"], "n": rule["count"]})
+        arb.append({"cn": ci.get("item_name") or child, "own": cv, "der": pv / rule["count"]})
 
     # ---------- 国际服 ----------
     intl_hi, intl_lo, league = [], [], None
@@ -392,8 +364,8 @@ def build(args):
             both = [r for r in both if r["p"] and r["i"]]
             for r in both:
                 r["iratio"] = r["p"] / r["i"]
-            intl_lo, intl_hi = (sorted(both, key=lambda r: r["iratio"])[:5],
-                                sorted(both, key=lambda r: -r["iratio"])[:5])
+            intl_lo, intl_hi = (sorted(both, key=lambda r: r["iratio"])[:6],
+                                sorted(both, key=lambda r: -r["iratio"])[:6])
         except Exception as e:  # noqa: BLE001
             print(f"[WARN] 国际服对比跳过：{e}")
 
@@ -402,103 +374,51 @@ def build(args):
     stamp = next((it.get("latest_datetime") for it in items.values() if it.get("latest_datetime")), "-")
     src_note = f"行情时间 {esc(str(stamp))}"
     if meta.get("cached"):
-        src_note += "（来自本地缓存）"
+        src_note += "（本地缓存）"
     if meta.get("stale"):
-        src_note += " ⚠️ 在线取数失败，已回退最近缓存"
-    if hlabel:
-        src_note += f" ｜ 多日列基于本地缓存（已积累 {len(hist_days)} 天）"
+        src_note += " ⚠️ 在线失败，已回退缓存"
+    net_note = (f"长线列为 {hlabel}" if hlabel else "长线列待积累（本地缓存仅今天，需每日运行）")
+
+    def item_table(rs, n=6):
+        heads = ["标的", "价", hlabel or "24h", "求购资金"]
+        body = [[f'<b>{esc(r["cn"])}</b>', fnum(r["p"]), delta(move_of(r)),
+                 fnum(r["v"]) if r["v"] else '<span class="down">薄</span>'] for r in rs[:n]]
+        return table(heads, body)
 
     kpis = [
         kpi("1 神圣石", f"{cpd:,.2f} C", "计价基准"),
-        kpi("1 崇高石", f"{anchors['base_in_chaos']:,.4f} C", "小额通货单位"),
-        kpi("缓存天数", str(len(hist_days) + 1), "含今天；越多历史列越有意义"),
+        kpi("1 崇高石", f"{anchors['base_in_chaos']:,.4f} C", "小额单位"),
+        kpi("本地缓存", f"{len(hist_days) + 1} 天", net_note),
     ]
 
+    # 摘要（只说最值得注意的）
     spot = []
-    if up:
-        spot.append(f'涨幅居前：<b>{esc(up[0]["cn"])}</b> '
-                    f'<span class="up">▲{up[0]["r24"]:.1f}%</span> → {fnum(up[0]["p"])}')
-    if down:
-        spot.append(f'长线跌幅居前：<b>{esc(down[0]["cn"])}</b> '
-                    f'<span class="down">▼{abs(down[0]["rh"]):.1f}%</span>（{hlabel}）→ {fnum(down[0]["p"])}')
-    elif not long_ok:
-        spot.append('长线（多日）判定暂缺：本地缓存仅 1 天，需每日运行积累')
-    if keep:
-        spot.append(f'波动最小的资产：<b>{esc(keep[0]["cn"])}</b> {fnum(keep[0]["p"])}'
-                    f'（求购资金 {fnum(keep[0]["v"])}）')
-    if bad:
-        spot.append(f'价差异常：<b>{esc(bad[0]["cn"])}</b> '
-                    f'{spread(bad[0]):.0f}×（挂高价难以成交）')
+    if strat:
+        b = max((s["top"][0] for s in strat if s["top"]), key=lambda r: r["p"] or 0)
+        spot.append(f'单件最贵：<b>{esc(b["cn"])}</b> {fnum(b["p"])}')
+        spot.append(f'资金最厚：<b>{esc(strat[0]["cat"])}</b> 求购体量 {fnum(strat[0]["tv"])}'
+                    f'，头部 {esc(strat[0]["top"][0]["cn"])} {fnum(strat[0]["top"][0]["p"])}')
+    if lux:
+        spot.append(f'高价值里最稳：<b>{esc(lux[0]["cn"])}</b> {fnum(lux[0]["p"])}')
+    if decline:
+        spot.append(f'长线跌幅最大：<b>{esc(decline[0]["cn"])}</b> {decline[0]["rh"]:.1f}%')
+    else:
+        spot.append('长线涨跌待积累：本地缓存仅 1 天，多日列需每日运行几天后才有意义')
     if arb:
         a = max(arb, key=lambda x: (x["der"] / x["own"]) if x["own"] else 99)
-        spot.append(f'合成划算：<b>{esc(a["cn"])}</b> 自身 {fnum(a["own"])} ＜ 合成价 {fnum(a["der"])}')
+        spot.append(f'碎片合成参考：<b>{esc(a["cn"])}</b> 自身 {fnum(a["own"])} ／ 合成价 {fnum(a["der"])}')
 
-    def r_rows(rs):
-        heads = ["道具", "价", "24h"] + ([hlabel] if hlabel else []) + ["求购资金"]
-        if not rs:
-            return heads, []
-        vmax = max((x["v"] or 0) for x in rs) or 1
-        body = [[f'<b>{esc(r["cn"])}</b><br><span class="tag">{esc(r["cat"])}</span>',
-                 fnum(r["p"]), delta(r["r24"])]
-                + ([delta(r["rh"])] if hlabel else [])
-                + [f'{fnum(r["v"])}{bar((r["v"] or 0) / vmax, "acc")}'] for r in rs]
-        return heads, body
+    # 策略卡片
+    cards = []
+    for s in strat:
+        cards.append(panel(f'{s["cat"]}', f'{s["n"]} 项 ｜ 体量 {fnum(s["tv"])}',
+                           item_table(s["top"], 5)))
+    strategy_html = f'<div class="grid3">{"".join(cards)}</div>'
 
-    h_up, b_up = r_rows(up)
-    h_dn, b_dn = r_rows(down)
-    cmax = max((abs(c["avg"]) for c in cat_stat if c["avg"]), default=1)
-    cat_rows = []
-    for c in sorted([x for x in cat_stat if x["avg"] is not None], key=lambda x: -x["avg"])[:10]:
-        cls = "up" if c["avg"] >= 0 else "down"
-        cat_rows.append([f'{esc(c["cat"])} <span class="dim">({c["n"]})</span>',
-                         f'<span class="{cls}">{c["avg"]:+.1f}%</span>',
-                         bar(abs(c["avg"]) / cmax, cls)])
-
-    if long_ok:
-        avoid_sub = f"价格 ≥ 1D 且 {hlabel} 跌幅 ≥ 20%"
-        avoid_body = (table(h_dn, b_dn) if b_dn
-                      else '<p class="hint">本期没有满足条件的标的</p>')
-    else:
-        avoid_sub = "待数据积累"
-        avoid_body = ('<p class="hint">长线下跌需要多日数据判定（当前本地缓存仅 1 天）。'
-                      '短周期（24h）波动不作为回避依据，建议先每日运行积累缓存。</p>')
-    farm = (f'<div class="grid">'
-            f'{panel("关注名单（上涨 + 有量）", "门槛：价格 ≥ 1D 或 求购资金 ≥ 100D；按 24h 涨幅排序", table(h_up, b_up))}'
-            f'{panel("回避名单（长线下跌）", avoid_sub, avoid_body)}'
-            f'</div><div style="margin-top:18px">'
-            f'{panel("各类目涨跌", "类目内 24h 平均涨跌", table(["类目", "均值", ""], cat_rows))}'
-            f'</div>')
-
-    ccards = []
-    for c, rs in craft:
-        body = "".join(
-            f'<tr><td>{esc(r["cn"])}</td><td>{fnum(r["p"])}</td><td>{delta(r["r24"])}</td>'
-            f'<td class="dim">{fnum(r["v"]) if r["v"] else "薄"}</td></tr>' for r in rs)
-        ccards.append(panel(c, "Top 3", "<table>" + body + "</table>"))
-    craft_html = f'<div class="grid3">{"".join(ccards)}</div>'
-    if arb:
-        craft_html += ('<div style="margin-top:18px">' +
-                       panel("碎片合成（自身价 vs 成品价 ÷ 份数）", "▼ 表示按合成价更值",
-                             table(["碎片", "自身价", "成品价", "合成价", ""],
-                                   [[f'<b>{esc(a["cn"])}</b>', fnum(a["own"]),
-                                     f'{esc(a["pc"])} {fnum(a["der"] * a["n"])}', fnum(a["der"]),
-                                     '<span class="up">▲ 取合成价</span>'
-                                     if (not a["own"] or a["der"] > a["own"]) else
-                                     '<span class="dim">取自身价</span>'] for a in arb])) +
-                       '</div>')
-
-    k_heads = ["道具", "价", "24h"] + ([hlabel] if hlabel else []) + ["求购资金", "保值分"]
-    k_rows = [[f'<b>{esc(r["cn"])}</b>', fnum(r["p"]), delta(r["r24"])]
-              + ([delta(r["rh"])] if hlabel else [])
-              + [fnum(r["v"]), f'{r["score"]*100:.0f}'] for r in keep]
-    wealth = panel("抗跌 · 变现 · 量级", "保值分 = 稳定性 × 求购资金 × 价格量级（有长线数据则用长线波动）",
-                   table(k_heads, k_rows))
-
-    b_rows = [[f'<b>{esc(r["cn"])}</b>', fnum(r["p"]), fnum(r["s"]),
-               f'{spread(r):.1f}×', fnum(r["v"]) if r["v"] else '<span class="down">薄</span>']
-              for r in bad[:8]]
-    avoid = panel("买卖价差异常", "价差 = 出售挂单价 ÷ 求购价；价差越大越难成交",
-                  table(["道具", "出售挂单价", "求购价", "价差", "求购资金"], b_rows))
+    lux_html = item_table(lux, 10) if lux else '<p class="hint">本期没有满足条件的标的</p>'
+    dec_html = (item_table(decline, 8) if decline else
+                '<p class="hint">需要多日数据（当前本地缓存仅 1 天）。短周期波动不构成下跌结论，'
+                '请先每日运行积累缓存。</p>')
 
     intl_html = ""
     if intl_lo or intl_hi:
@@ -507,8 +427,8 @@ def build(args):
         ih = [[f'<b>{esc(r["cn"])}</b>', fnum(r["p"]), fnum(r["i"]), f'{r["iratio"]:.2f}×']
               for r in intl_hi]
         intl_html = (f'<div class="grid">'
-                     f'{panel("国服更便宜", "比值 < 1", table(["道具", "国服", "国际服", "比值"], io))}'
-                     f'{panel("国服更贵", "比值 > 1", table(["道具", "国服", "国际服", "比值"], ih))}'
+                     f'{panel("国服更便宜", "比值 < 1", table(["标的", "国服", "国际服", "比值"], io))}'
+                     f'{panel("国服更贵", "比值 > 1", table(["标的", "国服", "国际服", "比值"], ih))}'
                      f'</div>')
 
     doc = f"""<!DOCTYPE html>
@@ -516,40 +436,45 @@ def build(args):
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>POE2 国服市场日报 {now}</title><style>{CSS}</style></head><body>
 <h1>POE2 国服市场日报</h1>
-<div class="stamp">生成于 {now} ｜ {src_note} ｜ 数据源 poecurrency.top（国服）· poe.ninja（{esc(league or '国际服')}）</div>
+<div class="stamp">生成于 {now} ｜ {src_note} ｜ 数据源 poecurrency.top · poe.ninja（{esc(league or '国际服')}）</div>
 
 <div class="kpis">{"".join(kpis)}</div>
 
 <section><h2><span class="ico">📌</span>行情摘要</h2>
 <ul class="bullets">{"".join(f"<li>{x}</li>" for x in spot)}</ul></section>
 
-{section("⛏️", "刷图收益", "Farm", "关注有量且上涨的标的；回避长线下跌的标的", farm)}
+{section("📋", "策略清单（按玩法）", "Farm",
+         "哪类玩法资金量大（值得投入）、每类最值钱的产出是什么。按市场体量排序",
+         strategy_html)}
 
-{section("🔨", "制作材料", "Crafting", "做装耗材按玩法类目分组，每类只列价格最高的三项", craft_html)}
+{section("💎", "高价值资产", "Wealth",
+         f"价格 ≥ {LUX_MIN_DIVINE:.0f}D 且相对稳定（含镜子 / 发辫等奢侈品）。适合长期持有或储值",
+         lux_html)}
 
-{section("🏦", "资产保值", "Wealth", "无统一基准货币，故以三项衡量：抗跌（多日波动小）、变现力（求购资金厚）、价值量级", wealth)}
+{section("📉", "长线下跌", "Avoid",
+         f"多日跌幅 ≥ {abs(DECLINE_PCT):.0f}% 的标的：不要囤、不要在下跌途中接货",
+         dec_html)}
 
-{section("🚫", "风险提示", "Risk", "买卖价差过大的标的：挂高价难以成交", avoid)}
-
-{section("🌍", "国服与国际服", "Reference", "仅供交叉参考，不参与过滤器档位判定", intl_html) if intl_html else ""}
+{section("🌍", "国服与国际服", "Reference",
+         "两边价差（国服价 ÷ 国际服价）。仅供交叉参考，不参与过滤器档位判定",
+         intl_html) if intl_html else ""}
 
 <footer>
 口径：<code>buy_avg</code> = 你要买入的价（游戏内「出售挂单」侧）；<code>sell_avg</code> = 你能卖到的价（「求购单」侧）；
-<code>sell*_vol</code> = 求购侧挂单的货币总量。保值分为自定口径，仅供参考。<br>
-数据：<code>cache/{game}/market-YYYY-MM-DD.json</code>（按日缓存，可用于多日回看）｜
-产物：<code>reports/</code> ｜
+<code>sell*_vol</code> = 求购侧挂单的货币总量。变化列优先用多日（长线），无多日数据时退回 24h。<br>
+数据：<code>cache/{game}/market-YYYY-MM-DD.json</code> ｜ 产物：<code>reports/</code> ｜
 生成：<code>python3 poe2-market-report.py</code>
 </footer></body></html>"""
     return doc
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="POE2 国服市场日报（v3）")
+    ap = argparse.ArgumentParser(description="POE2 国服市场日报（v5）")
     ap.add_argument("-o", "--output", default=None, help="指定输出 HTML 路径")
     ap.add_argument("--out-dir", default=None, help=f"输出目录（默认 {OUT_DIRNAME}/）")
     ap.add_argument("--cache-dir", default=None, help=f"缓存目录（默认 {CACHE_DIRNAME}/）")
     ap.add_argument("--refresh", action="store_true", help="忽略当天缓存，强制重新拉取")
-    ap.add_argument("--days", type=int, default=7, help="多日回看窗口天数（默认 7）")
+    ap.add_argument("--days", type=int, default=7, help="长线回看窗口天数（默认 7）")
     ap.add_argument("--game", default="poe2", choices=["poe2", "poe1"])
     ap.add_argument("--no-intl", action="store_true", help="跳过国服/国际服对比")
     ap.add_argument("--token", default=None, help="poecurrency.top token（默认读 config / 环境变量）")
