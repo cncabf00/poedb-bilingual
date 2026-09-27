@@ -37,7 +37,7 @@ CACHE_DIRNAME = "cache"
 OUT_DIRNAME = "reports"
 
 # 奢侈品/高价资产的判定门槛（以 D 为单位，运行时乘 cpd）
-LUX_MIN_DIVINE = 20.0
+LUX_MIN_DIVINE = 5.0
 # 长线下跌判定门槛（多日跌幅，%）
 DECLINE_PCT = -20.0
 
@@ -53,23 +53,32 @@ ONE_SIDED_WHITELIST = {"梦魇拟像裂片", "裂隙碎片"}
 STRATEGY_MAP = {
     "全局掉落": ["通货仓库", "精华", "符文"],
     "迷雾": ["液化情感", "渡鸦之触"],
-    "先祖密藏": ["合金通货", "先驱徽记", "溶剂", "秘术溶剂", "血脉辅助宝石"],
+    "先祖密藏": ["合金通货", "先驱徽记", "溶剂", "秘术溶剂", "星辉矿石"],
+    "血脉宝石": ["血脉辅助宝石"],          # 每样来自不同玩法，单列一类
     "深渊": ["凝视", "深渊通货"],
     "裂隙": ["催化剂"],
-    "祭祀": ["预兆"],
-    "神庙": ["神庙通货", "圣典", "灵核"],
+    "仪式": ["预兆"],                      # 国服叫「仪式」，不叫祭祀
+    "神庙": ["神庙通货", "圣典", "灵核"],  # 圣典/灵核：神庙+混沌试炼共同产出
     "碎片与首领": ["地图碎片"],
-    "待归类": ["星辉矿石", "雕像"],
 }
 
-# 个别道具的玩法修正（覆盖上面的类目归类）
+# 个别道具的玩法修正（覆盖上面的类目归类，按中文名）
 ITEM_OVERRIDE = {
     "变形锁骨": "裂隙",          # 主人指出：实际是裂隙产出
     "梦魇拟像": "迷雾",
     "梦魇拟像裂片": "迷雾",
     "裂隙石": "裂隙",
     "裂隙碎片": "裂隙",
+    "谄媚者之雕像": "仪式",       # 仪式 boss 系
+    "殉道者之雕像": "仪式",
+    "法利赛之雕像": "仪式",
 }
+
+# 名称前缀规则（类目内再分）：雕琢系列为仪式 boss 产出
+PREFIX_OVERRIDE = [("雕琢", "仪式")]
+
+# 类目兜底：雕像里除上述外均为小精灵玩法
+CAT_FALLBACK = {"雕像": "小精灵"}
 
 
 def load_tier_tool():
@@ -352,6 +361,11 @@ def build(args):
     def gameplay_of(r):
         if r["cn"] in ITEM_OVERRIDE:
             return ITEM_OVERRIDE[r["cn"]]
+        for pre, gp in PREFIX_OVERRIDE:
+            if r["cn"].startswith(pre):
+                return gp
+        if r["cat"] in CAT_FALLBACK:
+            return CAT_FALLBACK[r["cat"]]
         for gp, cs in STRATEGY_MAP.items():
             if r["cat"] in cs:
                 return gp
@@ -497,7 +511,7 @@ def build(args):
 <ul class="bullets">{"".join(f"<li>{x}</li>" for x in spot)}</ul></section>
 
 {section("📋", "策略清单（按玩法）", "Farm",
-         "已按玩法归一（迷雾 / 先祖密藏 / 深渊 / 裂隙 / 祭祀 / 神庙 / 全局掉落…）；"
+         "已按玩法归一（迷雾 / 先祖密藏 / 血脉宝石 / 深渊 / 裂隙 / 仪式 / 神庙 / 碎片与首领 / 全局掉落）；"
          "每类按求购资金降序列出前 12 项（只看价格会埋掉高流动性标的）。"
          "单边挂单的标的（市场不成立）已排除",
          strategy_html)}
